@@ -1,0 +1,55 @@
+# Which model the agent runs on, and how the harness reaches it.
+#
+#   route: claude  -> vendor/harness-levi-bridge (Claude Code OAuth), port 8765
+#   route: zai     -> vendor/zbridge (z.ai GLM Coding Plan), port 8766
+#
+# `model` is what harbor gets after -m. The provider prefix stays "anthropic/"
+# on both routes: the agent talks the Anthropic /v1/messages shape and each
+# bridge translates from there.
+#
+# `vision` records whether the model can read images. It is documentation only;
+# the runner patch keys off the model name.
+
+# `effort` reaches the SDK as reasoning_effort, so it applies on both routes:
+# Claude sizes its extended thinking from it, and litellm turns it into the
+# thinking budget that zbridge maps to GLM's own reasoning_effort. Keep it at
+# high: GLM returns no reasoning at all below that budget, so a low effort costs
+# the trajectory its thinking.
+models:
+  opus-5:
+    route: claude
+    model: anthropic/claude-opus-5
+    vision: true
+  glm-5.3-flash:
+    route: zai
+    model: anthropic/glm-5.3-flash
+    vision: true
+  glm-5.3:
+    route: zai
+    model: anthropic/glm-5.3
+    vision: false                  # z.ai rejects images; they arrive as a text note
+  glm-4.6v:
+    route: zai
+    model: anthropic/glm-4.6v
+    vision: true
+
+routes:
+  claude:
+    dir: vendor/harness-levi-bridge
+    start: ./claude_code_bridge.sh start
+    health: http://172.17.0.1:8765/healthz
+    base_url: http://172.17.0.1:8765
+    api_key: sk-ant-oauth-bridge-stub
+  zai:
+    dir: vendor/zbridge
+    start: ./zbridge.sh start
+    health: http://172.17.0.1:8766/healthz
+    base_url: http://172.17.0.1:8766
+    api_key_from_env: ZB_BRIDGE_SECRET   # read from vendor/zbridge/.env
+
+defaults:
+  attempts: 8            # -k
+  concurrent: 2          # -n
+  retries: 2             # -r
+  effort: high           # --effort low|high; high keeps thinking in the trajectory
+  judge_model: gpt-5.6-sol

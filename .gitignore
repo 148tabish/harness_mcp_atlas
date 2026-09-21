@@ -1,0 +1,14 @@
+.venv/
+.env
+out/
+vendor/*/.venv*/
+vendor/*/logs/
+vendor/zbridge/.env
+vendor/*/.*.pid
+__pycache__/
+*.pyc
+
+# Task content is benchmark data: instructions, evidence, gold answers and canary
+# GUIDs. It never belongs in a shared repo; only the contract lives here.
+input/*/
+!input/README.md

@@ -1,0 +1,7 @@
+# Runtime dependencies for the Claude Code OAuth bridge.
+# These are the only three the bridge needs; they are already present in the
+# LEVI harness .venv, so install this file only when running the bridge
+# standalone (outside the harness checkout).
+fastapi>=0.110
+uvicorn>=0.27
+httpx>=0.27
