@@ -29,6 +29,24 @@ def _task_blocks(raw: str) -> str:
     return "\n".join(lines[start:stop]).rstrip() + "\n"
 
 
+def _with_wired_servers(blocks: str, raw: str) -> str:
+    """Record every server the task wires, not just the graded apps.
+
+    `apps` names the graded ones; a task usually wires more, the ungraded
+    distractors that make the search real. Without this the rebuild would drop
+    them and the task would be easier than the one that was authored.
+    """
+    wired = [ln.split('"')[1] for ln in raw.splitlines()
+             if ln.startswith("name = ") and '"Light' in ln]
+    if not wired or "mcp_servers = " in blocks:
+        return blocks
+    listing = "[" + ", ".join(f'"{w}"' for w in wired) + "]"
+    note = ("# every server wired into the environment: the graded apps above plus\n"
+            "# the ungraded distractors\n")
+    return re.sub(r"^(apps = .*)$", lambda m: f"{m.group(1)}\n{note}mcp_servers = {listing}",
+                  blocks, count=1, flags=re.M)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="harness.import_task", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -48,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     dest.mkdir(parents=True)
 
     raw = (src / "task.toml").read_text()
-    (dest / "task.toml").write_text(_task_blocks(raw))
+    (dest / "task.toml").write_text(_with_wired_servers(_task_blocks(raw), raw))
     shutil.copy2(src / "instruction.md", dest / "instruction.md")
 
     (dest / "environment").mkdir()
