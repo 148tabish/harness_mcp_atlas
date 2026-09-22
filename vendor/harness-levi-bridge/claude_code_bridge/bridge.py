@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 from typing import Any, Union
 
 import httpx
@@ -124,8 +125,34 @@ STRIP_HEADERS_OUT = frozenset(
 ProviderLike = Union[CredentialProvider, MultiAccountCredentialProvider]
 
 
+# Hosts the bridge may forward to. Every forwarded request carries this
+# machine's live OAuth bearer token, so an upstream that is merely configurable
+# is a token handed to whoever sets the variable. Extend with a comma-separated
+# AURORA_CC_UPSTREAM_ALLOW; nothing outside the list is ever contacted.
+UPSTREAM_ALLOWED_HOSTS = ("api.anthropic.com",)
+
+
+class UpstreamRefused(ValueError):
+    """An upstream outside the allowlist, refused before any token leaves."""
+
+
 def _upstream_base() -> str:
-    return os.environ.get("AURORA_CC_UPSTREAM", UPSTREAM_DEFAULT).rstrip("/")
+    raw = os.environ.get("AURORA_CC_UPSTREAM", UPSTREAM_DEFAULT).strip().rstrip("/")
+    allowed = set(UPSTREAM_ALLOWED_HOSTS) | {
+        h.strip().lower() for h in os.environ.get("AURORA_CC_UPSTREAM_ALLOW", "").split(",")
+        if h.strip()}
+    parsed = urllib.parse.urlsplit(raw)
+    # Compare the parsed host, never a substring: "https://api.anthropic.com.evil.io"
+    # and "https://evil.io/?api.anthropic.com" both contain the allowed name.
+    # Credentials in the authority, a path or a query are refused outright,
+    # since each is a way to smuggle a second destination past the check.
+    if (parsed.scheme != "https" or (parsed.hostname or "").lower() not in allowed
+            or parsed.username or parsed.password or parsed.path or parsed.query
+            or parsed.fragment):
+        raise UpstreamRefused(
+            f"upstream {raw!r} is not an https URL on an allowed host "
+            f"({', '.join(sorted(allowed))}); refusing to forward the OAuth token")
+    return raw
 
 
 def _max_inline_retries() -> int:
@@ -591,6 +618,7 @@ def _resolve_provider() -> ProviderLike:
 
 def build_app(provider: ProviderLike | None = None) -> FastAPI:
     app = FastAPI(title="Claude Code OAuth Bridge (aurora)", version="1.1.0")
+    _upstream_base()       # refuse a disallowed upstream at startup, not on the first request
     prov: ProviderLike = provider if provider is not None else _resolve_provider()
     inject = os.environ.get("AURORA_CC_SKIP_SYSTEM_PREFIX") != "1"
 

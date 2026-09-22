@@ -66,14 +66,21 @@ def canary_binding(src: Path) -> list[str]:
         return []
     found = re.findall(r"instruction-canary\s+([0-9a-fA-F-]{36})",
                        instruction.read_text(errors="ignore"))
+    # No record is not a pass. The identity is minted, with its canary bound,
+    # before this gate runs; a task that still has none was never bound, and a
+    # check with nothing to compare against has checked nothing.
     if not identity_path.is_file():
-        return [] if not found else []          # first build mints and records it
+        return ["no .identity.json: this task's canary was never bound, so a copied "
+                "instruction could not be told apart from its own"]
     try:
         identity = json.loads(identity_path.read_text())
     except (OSError, ValueError) as exc:
         return [f".identity.json does not parse: {exc}"]
     recorded = identity.get("instruction_canary")
-    if recorded and found and recorded not in found:
+    if not recorded:
+        return [".identity.json records no instruction_canary, so the instruction's "
+                "canary is bound to nothing"]
+    if found and recorded not in found:
         return [f"instruction.md carries canary {found[0]}, but this task recorded "
                 f"{recorded}; a copied instruction traces a leak to the wrong task"]
     if len(set(found)) > 1:
@@ -183,14 +190,45 @@ def contamination_screen(src: Path, meta: dict) -> list[str]:
             problems.append(f"contamination_screen has no {field}")
     roots = record.get("roots") or {}
     for root in SCREEN_ROOTS:
-        state = str(roots.get(root) or "").strip().lower()
-        if not state:
-            problems.append(f"contamination_screen roots has no {root}: name the root it "
-                            f"resolved against, or 'unresolved'")
-        elif state == "unresolved":
-            problems.append(f"contamination_screen {root} is unresolved, so this task is "
-                            f"not screened against it; the screen refuses rather than passes")
+        problems += _verify_root(src, root, str(roots.get(root) or "").strip())
     return problems
+
+
+_ROOT_REF = re.compile(r"^(?P<path>[^@\s]+)@sha256:(?P<digest>[0-9a-f]{64})$")
+
+
+def _verify_root(src: Path, name: str, ref: str) -> list[str]:
+    """A root is a file and its digest, and the file must still have that digest.
+
+    A name alone is an attestation: anyone can write "exclusions@2026-09" whether
+    or not a screen ever read it. Binding the root to the SHA-256 of its bytes,
+    and recomputing that here, turns the record into something this gate can
+    check - the screen claims to have used exactly these bytes, and these bytes
+    are what the path holds now. A root this gate cannot read is refused rather
+    than trusted.
+    """
+    import hashlib
+    if not ref:
+        return [f"contamination_screen roots has no {name}: record it as "
+                f"<path>@sha256:<digest>, or 'unresolved'"]
+    if ref.lower() == "unresolved":
+        return [f"contamination_screen {name} is unresolved, so this task is not screened "
+                f"against it; the screen refuses rather than passes"]
+    m = _ROOT_REF.match(ref)
+    if not m:
+        return [f"contamination_screen {name} = {ref!r} is not <path>@sha256:<64 hex>; a "
+                f"root named without its digest is an attestation, not a record"]
+    path = Path(m.group("path"))
+    path = path if path.is_absolute() else (src / path)
+    if not path.is_file():
+        return [f"contamination_screen {name} root {m.group('path')} cannot be read here, "
+                f"so its digest cannot be checked; refusing rather than trusting it"]
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != m.group("digest"):
+        return [f"contamination_screen {name} root {m.group('path')} hashes to {actual[:16]}…, "
+                f"not the recorded {m.group('digest')[:16]}…; the screen ran against "
+                f"different bytes than the ones on disk"]
+    return []
 
 
 # --------------------------------------------------------------- H-4 collision

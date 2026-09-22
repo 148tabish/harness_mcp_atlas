@@ -98,14 +98,20 @@ license = "CC-BY-4.0"
 [task.metadata.contamination_screen]
 instrument = "crucible 0.4.2"
 screened_on = "2026-09-22"
-roots = { exclusion_list = "engram/exclusions@2026-09", freeze_table = "unresolved", near_duplicate_index = "unresolved" }
+# each root is the file the screen read, bound to the SHA-256 of its bytes
+roots = { exclusion_list = "roots/exclusions.txt@sha256:<64 hex>", freeze_table = "roots/freeze.csv@sha256:<64 hex>", near_duplicate_index = "roots/neardup.idx@sha256:<64 hex>" }
 ```
 
 The harness requires these records and checks their shape. It does not verify
-the claims: whether a source is what the author says, and whether a cutoff is
-true, are facts from outside this repository. A root recorded as `unresolved`
-**fails** validation rather than passing, because a screen that could not run
-is not a screen that found nothing.
+the provenance claims: whether a source is what the author says, and whether a
+cutoff is true, are facts from outside this repository.
+
+It does verify the screening roots. Each is `<path>@sha256:<digest>`, and the
+gate re-hashes the file and compares, so the record says which bytes the screen
+read and the gate confirms they are still those bytes. A bare root name is an
+attestation and fails; so does a root the gate cannot read, a digest that no
+longer matches, or `unresolved` - a screen that could not run is not a screen
+that found nothing.
 
 `tests/test_weights.json` also declares `null_floor`: the reward an empty
 submission earns, which a real run has to beat. Measure it with a nop run; do
@@ -194,5 +200,19 @@ Copy the `harness-new/` folder, then on the new machine:
 
 Two caveats worth stating plainly: the codex login is personal, so each operator
 needs their own or the rubric goes unscored; and only one bridge can hold each
-port, so two harness copies on one machine will share whichever bridge started
-first.
+port, and the harness refuses to use one it did not start (there is no
+override), so stop any other copy's bridge before running.
+
+## Security boundaries
+
+- **Bridge upstream.** The Claude bridge forwards only to `https://api.anthropic.com`.
+  Every forwarded request carries the live OAuth token, so `AURORA_CC_UPSTREAM`
+  pointing anywhere else refuses to start. A genuine proxy is added by host in
+  `AURORA_CC_UPSTREAM_ALLOW`; the comparison is on the parsed host, never a
+  substring, and credentials, paths or queries in the URL are refused.
+- **Workspace containment.** The filesystem MCP tools resolve every path and
+  refuse anything outside `/workspace`, `..` and symlinks included.
+- **Server loading.** The light servers import only the servers `entrypoint.sh`
+  declares; an `app.py` anywhere else in the tree is reported and not run.
+- **No shell.** The harness passes arguments as lists; nothing from config or a
+  URL is interpolated into a shell command.

@@ -70,10 +70,12 @@ def main(argv: list[str] | None = None) -> int:
     say(f"logging to {log_path}")
 
     try:
+        # identity first: minting it binds the instruction's canary, so the
+        # canary gate in validate always has a record to compare against
+        task_uuid, _ = build_mod.identity(src)
+
         if "validate" in steps:
             validate(src)
-
-        task_uuid, _ = build_mod.identity(src)
         task_dir = BUILD_DIR / task_uuid
         if "build" in steps:
             task_dir = build_mod.build(src)

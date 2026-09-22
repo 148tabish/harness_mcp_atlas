@@ -4,7 +4,9 @@ from __future__ import annotations
 import base64
 import os
 import re
+import shlex
 import shutil
+import urllib.parse
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -23,11 +25,25 @@ def _healthy(url: str) -> bool:
         return False
 
 
+def _port_of(url: str) -> int:
+    """The port in a configured URL, as a number or a refusal."""
+    port = urllib.parse.urlsplit(url).port
+    if port is None or not 0 < port < 65536:
+        raise Failure(f"no usable port in {url!r}")
+    return port
+
+
 def _port_owner(url: str) -> tuple[str, str] | None:
-    """(pid, cwd) of whatever already listens on the port in `url`, if anything."""
-    port = url.rsplit(":", 1)[-1].split("/")[0]
-    proc = run(f"ss -ltnp 2>/dev/null | grep ':{port} '", capture=True, check=False)
-    match = re.search(r"pid=(\d+)", proc.stdout or "")
+    """(pid, cwd) of whatever already listens on the port in `url`, if anything.
+
+    The port comes from config, so it is parsed to an integer and matched in
+    Python; nothing from the URL ever reaches a shell.
+    """
+    port = _port_of(url)
+    proc = run(["ss", "-ltnp"], capture=True, check=False)
+    line = next((ln for ln in (proc.stdout or "").splitlines()
+                 if len(ln.split()) > 3 and ln.split()[3].rsplit(":", 1)[-1] == str(port)), "")
+    match = re.search(r"pid=(\d+)", line)
     if not match:
         return None
     pid = match.group(1)
@@ -46,19 +62,19 @@ def start_bridge(route_cfg: dict) -> dict[str, str]:
     # A bridge from another checkout answering on this port would run code this
     # harness has never seen - a different runner patch, a different thinking
     # setting - and the run would look fine while grading something else.
+    # There is no override: a switch that skips this check is the check's own
+    # bypass, and whoever can set it can put any bridge between the agent and
+    # the model.
     owner = _port_owner(route_cfg["health"])
     if owner and Path(owner[1]).resolve() != d.resolve():
-        if os.environ.get("HARNESS_ALLOW_FOREIGN_BRIDGE") != "1":
-            raise Failure(
-                f"port for {route_cfg['health']} is held by pid {owner[0]} running from "
-                f"{owner[1] or 'an unknown directory'}, not this harness's {d}.\n"
-                f"  stop it and re-run, or set HARNESS_ALLOW_FOREIGN_BRIDGE=1 to use it as is.")
-        say(f"WARNING: using the bridge already running from {owner[1]}")
-        return _bridge_env(route_cfg, d)
+        raise Failure(
+            f"port for {route_cfg['health']} is held by pid {owner[0]} running from "
+            f"{owner[1] or 'an unknown directory'}, not this harness's {d}.\n"
+            f"  stop it (kill {owner[0]}) and re-run; this harness starts its own.")
 
     if not _healthy(route_cfg["health"]):
         say(f"starting bridge in {d.name}")
-        run(route_cfg["start"], cwd=d, capture=True)
+        run(shlex.split(route_cfg["start"]), cwd=d, capture=True)
     if not _healthy(route_cfg["health"]):
         raise Failure(f"bridge did not answer {route_cfg['health']}; see {d}/logs/")
     say(f"bridge up at {route_cfg['base_url']}")
@@ -90,7 +106,7 @@ def clear_stale_containers() -> None:
     """Trial containers a killed run left behind would hold the ports."""
     if not shutil.which("docker"):
         return
-    proc = run("docker ps -a --format '{{.Names}}'", capture=True, check=False)
+    proc = run(["docker", "ps", "-a", "--format", "{{.Names}}"], capture=True, check=False)
     names = [n for n in (proc.stdout or "").splitlines() if "__env-" in n]
     if names:
         say(f"removing {len(names)} leftover trial containers")
