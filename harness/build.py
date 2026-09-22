@@ -122,11 +122,8 @@ def build(src: Path) -> Path:
     meta = tomllib.loads(raw)
     task_uuid, canary = identity(src)
     dest = BUILD_DIR / task_uuid
-    if dest.exists():
-        shutil.rmtree(dest)              # a rebuild always starts clean
-    dest.mkdir(parents=True)
 
-    # ---- task.toml: harness boilerplate + the author's blocks + the wiring ----
+    # ---- every check that can refuse runs before a byte of the old build goes ----
     md = ((meta.get("task") or {}).get("metadata") or {})
     # `apps` are the graded ones; `mcp_servers`, when given, is everything wired,
     # graded apps plus the ungraded distractors that make the search real.
@@ -137,8 +134,24 @@ def build(src: Path) -> Path:
         raise Failure(f"unknown Light apps (not served by vendor/light-servers): {unknown}")
     timeout = md.get("agent_timeout_sec", 3600)
     boiler = (TEMPLATES / "task.boilerplate.toml").read_text()
-    boiler = boiler.replace("{{CANARY}}", canary).replace("{{AGENT_TIMEOUT}}", str(timeout))
+    # the author declares the contract version the task was written against; the
+    # boilerplate is what the build actually emits, and the two must agree or the
+    # declaration names a contract this task is not built to
+    emitted = re.search(r'^schema_version = "([^"]+)"', boiler, re.M)
+    declared = meta.get("schema_version")
+    if emitted and declared and declared != emitted.group(1):
+        raise Failure(f'task.toml declares schema_version "{declared}", but this harness '
+                      f'builds "{emitted.group(1)}"')
     author = _task_blocks(raw)
+
+    # A refused build leaves the previous one standing. Clearing first and
+    # checking after would turn any refusal into a deleted task.
+    if dest.exists():
+        shutil.rmtree(dest)              # a rebuild always starts clean
+    dest.mkdir(parents=True)
+
+    # ---- task.toml: harness boilerplate + the author's blocks + the wiring ----
+    boiler = boiler.replace("{{CANARY}}", canary).replace("{{AGENT_TIMEOUT}}", str(timeout))
     # the task's harbor name is always atlas/<uuid>, whatever the folder is called
     author = re.sub(r'^name = ".*"$', f'name = "atlas/{task_uuid}"', author, count=1, flags=re.M)
     (dest / "task.toml").write_text(boiler + "\n" + author + _mcp_servers(apps, ports))
