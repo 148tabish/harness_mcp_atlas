@@ -10,12 +10,19 @@ import re
 import tomllib
 from pathlib import Path
 
-from .common import Failure, say
+from . import gates
+from .common import BUILD_DIR, Failure, say
 
 REQUIRED_FILES = ["instruction.md", "task.toml", "tests/test_outputs.py",
                   "tests/rubric.json", "tests/test_weights.json",
-                  "environment/Dockerfile"]
+                  "tests/oracle.json", "environment/Dockerfile",
+                  # the oracle, the world it produces and the answer it states:
+                  # a solution/ that only exists as a directory cannot be replayed
+                  "solution/solve.py", "solution/gt_env.json", "solution/TRUTH.md"]
 REQUIRED_DIRS = ["data", "world_data", "solution"]
+
+# a world overlay with one placeholder file is an empty world with extra steps
+MIN_WORLD_FILES = 2
 
 # blocks the harness owns; an author who writes them would be overridden silently
 HARNESS_OWNED = ["[agent]", "[verifier]", "[verifier.env]", "[verifier.environment]",
@@ -33,10 +40,15 @@ def validate(src: Path) -> dict:
         d = src / rel
         if not d.is_dir():
             problems.append(f"missing directory: {rel}/")
-        elif rel in ("data", "world_data") and not any(d.rglob("*")):
+        elif rel in ("data", "world_data"):
             # an empty evidence folder builds cleanly and leaves the agent with
             # nothing to read, which looks like a bad model rather than a bad task
-            problems.append(f"{rel}/ is empty")
+            files = [p for p in d.rglob("*") if p.is_file()]
+            if not files:
+                problems.append(f"{rel}/ is empty")
+            elif rel == "world_data" and len(files) < MIN_WORLD_FILES:
+                problems.append(f"world_data/ holds {len(files)} file; an overlay that seeds "
+                                f"nothing leaves the apps at their stock corpus")
 
     data: dict = {}
     toml_path = src / "task.toml"
@@ -56,9 +68,17 @@ def validate(src: Path) -> dict:
         # graded subset. build.py resolves mcp_servers first and falls back to
         # apps, so either one on its own is a complete answer here.
         md = (task.get("metadata") or {})
-        if not (md.get("mcp_servers") or md.get("apps")):
+        wired, graded = md.get("mcp_servers") or [], md.get("apps") or []
+        if not (wired or graded):
             problems.append("task.toml [task.metadata] needs mcp_servers = [...] "
                             "(every server to wire) or apps = [...] (the graded ones)")
+        # build.py wires mcp_servers when both are given, so a graded app missing
+        # from that list would never be wired and every check on it would fail
+        for app in sorted(set(graded) - set(wired)) if (wired and graded) else []:
+            problems.append(f"apps lists {app}, which mcp_servers does not wire")
+        if not data.get("schema_version"):
+            problems.append('task.toml has no schema_version (the contract version '
+                            'its blocks are written against, e.g. "1.4")')
 
     # tests
     weights_path = src / "tests" / "test_weights.json"
@@ -74,6 +94,11 @@ def validate(src: Path) -> dict:
                 problems.append("tests/test_weights.json has no components.traj_tests.tests")
             if not (components.get("rubric") or {}).get("file"):
                 problems.append("tests/test_weights.json has no components.rubric.file")
+            # the reward a run that does nothing must not clear: without it stated,
+            # nobody can say what score an empty submission would have earned
+            if weights.get("null_floor") is None:
+                problems.append("tests/test_weights.json has no null_floor: the reward an "
+                                "empty submission scores, which a real run must beat")
             named = set(traj)
             if (src / "tests" / "test_outputs.py").is_file():
                 body = (src / "tests" / "test_outputs.py").read_text()
@@ -102,6 +127,15 @@ def validate(src: Path) -> dict:
                         problems.append(f"tests/rubric.json criterion {i} "
                                         f"({str(c.get('criterion', ''))[:40]}) has no {field}")
 
+    # A floating tag rebuilds into a different image months later, so a run can
+    # never be reproduced and two runs cannot be compared.
+    dockerfile = src / "environment" / "Dockerfile"
+    if dockerfile.is_file():
+        for line in dockerfile.read_text().splitlines():
+            if line.strip().upper().startswith("FROM ") and "@sha256:" not in line:
+                problems.append(f"environment/Dockerfile is not pinned to a digest: "
+                                f"{line.strip()[:60]}")
+
     # The grader pulls helpers out of test_outputs at import time. A name it needs
     # and the tests do not define aborts it inside the verifier, which leaves no
     # reward.json and fails the trial after the whole run has been paid for.
@@ -120,10 +154,17 @@ def validate(src: Path) -> dict:
             problems.append(f"tests/grade.py binds {name} at import, which test_outputs.py "
                             f"does not define; the grader would abort and write no reward")
 
-    # the oracle's answers belong in solution/, never where the agent or the judge can see them
-    for leaked in ("gt_env.json", "oracle.json"):
-        for hit in list(src.glob(f"data/**/{leaked}")) + list(src.glob(f"world_data/**/{leaked}")):
-            problems.append(f"{hit.relative_to(src)} would ship to the agent; keep it in solution/")
+    # the answer must sit only where the grader reads it, the instruction's canary
+    # must be this task's own, and the solution's wording must not already be on
+    # the agent's side of the boundary
+    problems += gates.private_boundary(src)
+    problems += gates.canary_binding(src)
+    problems += gates.containment(src)
+
+    # what the bundle claims about where it came from and what it was screened against
+    problems += gates.provenance(data)
+    problems += gates.contamination_screen(src, data)
+    problems += gates.collision(src, BUILD_DIR.parent / "task_registry.json")
 
     if problems:
         raise Failure("input folder does not meet the task contract:\n  - "

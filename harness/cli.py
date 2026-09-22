@@ -13,13 +13,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import build as build_mod
+from . import regrade as regrade_mod
 from . import report as report_mod
 from . import runjob
 from .common import (BUILD_DIR, Failure, JOBS_DIR, PACKAGED_DIR, ROOT, die,
                      load_models, open_log, run, say)
 from .validate import validate
 
-STEPS = ("validate", "build", "run", "report", "package")
+STEPS = ("validate", "build", "run", "regrade", "report", "package")
+# a fresh run grades as it goes; regrade is for re-verifying a job that already ran
+DEFAULT_STEPS = tuple(s for s in STEPS if s != "regrade")
 
 
 def _job_name(src: Path, model_key: str, given: str | None) -> str:
@@ -52,7 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--job", type=Path, help="existing job folder, for --only report/package")
     args = ap.parse_args(argv)
 
-    steps = set(args.only or STEPS)
+    steps = set(args.only or DEFAULT_STEPS)
     if args.no_package:
         steps.discard("package")
     src = args.task if args.task.is_absolute() else (ROOT / args.task)
@@ -83,13 +86,17 @@ def main(argv: list[str] | None = None) -> int:
                 task_dir, args.model, job_name,
                 args.attempts, args.concurrent, args.retries,
                 None if args.effort == "none" else args.effort, args.judge_model)
-        elif job is None and steps & {"report", "package"}:
+        elif job is None and steps & {"regrade", "report", "package"}:
             jobs = sorted((p for p in JOBS_DIR.glob("*") if p.is_dir()),
                           key=lambda p: p.stat().st_mtime)
             if not jobs:
                 die("no job to work on; pass --job")
             job = jobs[-1]
             say(f"using latest job {job.name}")
+
+        if "regrade" in steps:
+            job = regrade_mod.regrade(job, task_dir, args.judge_model,
+                                      runjob.judge_env(args.judge_model).get("CODEX_AUTH_B64"))
 
         if "report" in steps:
             report_mod.summarise(job, task_dir, args.threshold)

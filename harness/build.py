@@ -50,12 +50,17 @@ def _stamp(text: str, canary: str) -> str:
     return "\n".join([CANARY_LINE, f"# harbor-canary GUID {canary}"] + lines) + "\n"
 
 
-def _instruction_canary(src: Path) -> str:
-    """A second GUID, carried by the instruction only, so a leak can be told apart."""
+def _instruction_canary(src: Path, existing: str | None = None) -> str:
+    """A second GUID, carried by the instruction only, so a leak can be told apart.
+
+    An instruction that already carries one has it recorded rather than replaced:
+    the recorded value is what a later validate compares against, and a canary
+    with nothing to compare it to catches no copied instruction.
+    """
     path = src / ".identity.json"
-    data = json.loads(path.read_text())
-    if "instruction_canary" not in data:
-        data["instruction_canary"] = str(uuid.uuid4())
+    data = json.loads(path.read_text()) if path.is_file() else {}
+    if not data.get("instruction_canary"):
+        data["instruction_canary"] = existing or str(uuid.uuid4())
         write_json(path, data)
     return data["instruction_canary"]
 
@@ -140,7 +145,10 @@ def build(src: Path) -> Path:
 
     # ---- instruction: kept verbatim, with its own canary at the top if it has none ----
     instruction = (src / "instruction.md").read_text()
-    if "instruction-canary" not in instruction:
+    carried = re.search(r"instruction-canary\s+([0-9a-fA-F-]{36})", instruction)
+    if carried:
+        _instruction_canary(src, carried.group(1))       # record what it already carries
+    else:
         instruction = f"<!-- instruction-canary {_instruction_canary(src)} -->\n" + instruction
     (dest / "instruction.md").write_text(instruction)
 

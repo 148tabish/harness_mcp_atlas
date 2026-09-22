@@ -81,12 +81,57 @@ input/<task>/
 ```
 
 `[task.metadata]` needs `apps` (the graded servers) and may add `mcp_servers`
-(everything wired, graded apps plus ungraded distractors). Ports are read from
-the light servers' own `entrypoint.sh`, so they cannot drift.
+(everything wired, graded apps plus ungraded distractors); every graded app must
+also appear in `mcp_servers`, since that is the list the build wires. Ports are
+read from the light servers' own `entrypoint.sh`, so they cannot drift.
+
+`task.toml` also declares, at the top level and in `[task.metadata]`:
+
+```toml
+schema_version = "1.4"          # the contract version these blocks are written against
+
+[task.metadata.upstream_provenance]
+origin = "authored in-house from the 1883 Fishery Board report"
+train_cutoff = "2026-01-31"     # the per-instance cutoff this task is safe against
+license = "CC-BY-4.0"
+
+[task.metadata.contamination_screen]
+instrument = "crucible 0.4.2"
+screened_on = "2026-09-22"
+roots = { exclusion_list = "engram/exclusions@2026-09", freeze_table = "unresolved", near_duplicate_index = "unresolved" }
+```
+
+The harness requires these records and checks their shape. It does not verify
+the claims: whether a source is what the author says, and whether a cutoff is
+true, are facts from outside this repository. A root recorded as `unresolved`
+**fails** validation rather than passing, because a screen that could not run
+is not a screen that found nothing.
+
+`tests/test_weights.json` also declares `null_floor`: the reward an empty
+submission earns, which a real run has to beat. Measure it with a nop run; do
+not assert it.
 
 The harness rejects an input folder that carries `[agent]`, `[verifier]` or
-`[environment]` blocks: it owns those. It also rejects a `gt_env.json` or
-`oracle.json` found under `data/` or `world_data/`, where the agent would see it.
+`[environment]` blocks: it owns those.
+
+It also enforces the private boundary between what the grader knows and what the
+agent can read:
+
+- no `gt_env.json`, `oracle.json`, `TRUTH.md`, `solve.py` or `solve.sh` under
+  `data/` or `world_data/`, and no mention of them in `instruction.md`
+- the canary in `instruction.md` must be the one this task recorded in
+  `.identity.json`, so a copied instruction cannot trace a leak to the wrong task
+- at most 2% of the wording in `TRUTH.md` and `solve.py` may reappear in what the
+  agent can read (8-word shingles). `gt_env.json` is excluded from that scan: it
+  is the world the oracle leaves behind, so it restates the seed world by
+  construction, and scanning it would measure that construction rather than a leak
+- `environment/Dockerfile` must pin every `FROM` to a `@sha256:` digest
+- two tasks whose `instruction.md` states the same problem are flagged as a
+  collision, tracked in `out/task_registry.json`
+
+None of this establishes that a task is uncontaminated. It establishes that named
+checks ran. Overlap below the threshold is exactly what a deterministic check
+cannot see.
 
 To turn an existing built task into an input folder:
 
