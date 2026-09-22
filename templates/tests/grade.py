@@ -17,14 +17,25 @@ import test_outputs as _t
 from test_outputs import *  # noqa: F401,F403
 
 _CACHE = _t._CACHE
-_OLD_ENV_PATH = _t._OLD_ENV_PATH
-_entities = _t._entities
 _json = _t._json
-_load_env = _t._load_env
 _os = _t._os
-_s_available = _t._s_available
-_state_diff = _t._state_diff
-_state_misbehaved = _t._state_misbehaved
+
+# The world-state block is optional. A task whose checks read the trajectory and
+# the delivered files carries no snapshot helpers, and binding them here aborts
+# the grader before it scores anything: no reward.json, and harbor then fails the
+# whole trial even though pytest and the rubric judge both ran. Nothing
+# scoring-related rides on this - the state channel is diagnostic output with
+# `graded: false`, feeding only a gate a task must declare in test_weights.json.
+_HAS_STATE = all(hasattr(_t, _n) for _n in (
+    '_OLD_ENV_PATH', '_entities', '_load_env', '_s_available',
+    '_state_diff', '_state_misbehaved'))
+if _HAS_STATE:
+    _OLD_ENV_PATH = _t._OLD_ENV_PATH
+    _entities = _t._entities
+    _load_env = _t._load_env
+    _s_available = _t._s_available
+    _state_diff = _t._state_diff
+    _state_misbehaved = _t._state_misbehaved
 
 
 def _write_grade_report(out: dict, gate: dict) -> None:
@@ -61,12 +72,17 @@ def _write_grade_report(out: dict, gate: dict) -> None:
         dest = pathlib.Path(_os.environ.get('AUTH_GRADE_REPORT', '/logs/verifier/grade_report.md'))
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text('\n'.join(lines))
-    except Exception:
-        pass
+    except Exception as exc:
+        # the report is a reader's aid, never a reward input, so a failure here
+        # must not stop grading - but it must be visible, since a missing report
+        # otherwise looks the same as a task that had nothing to report
+        print(f'[grade] could not write the grade report: {exc!r}', file=_sys.stderr)
 
 def write_state_channel_json():
     import pathlib
-    if not _s_available():
+    if not _HAS_STATE:
+        out = {'available': False, 'completion': None, 'misbehave': None, 'reason': "this task's tests carry no world-state block"}
+    elif not _s_available():
         out = {'available': False, 'completion': None, 'misbehave': None, 'reason': 'no end_env.json: the collect hook shipped no snapshot'}
     else:
         missing, unexpected, changed = _state_diff()
@@ -80,7 +96,20 @@ def write_state_channel_json():
     except OSError:
         pass
     _CACHE['state_channel'] = out
-    assert out['completion'] in (None, 0.0, 1.0)
+    # This channel is diagnostic. A value outside the set means the snapshot
+    # comparison is unreliable, which is worth recording - but raising here
+    # would take evaluate.sh down with it and cost the trial a reward it earned.
+    if out['completion'] not in (None, 0.0, 1.0):
+        out['completion_out_of_range'] = out['completion']
+        out['completion'] = None
+        out['reason'] = 'state completion was not one of None, 0.0, 1.0; treated as unavailable'
+        out['available'] = False
+        try:
+            dest.write_text(_json.dumps(out, indent=2))
+        except OSError:
+            pass
+        print('[grade] state completion out of range; state channel marked unavailable',
+              file=_sys.stderr)
 
 def write_reward_json():
     import pathlib
@@ -93,14 +122,9 @@ def write_reward_json():
                 break
         except (OSError, ValueError):
             continue
-    comps = {}
-    for cand in (pathlib.Path(__file__).resolve().parent / 'test_weights.json', pathlib.Path('/tests/test_weights.json')):
-        try:
-            comps = _json.loads(cand.read_text()).get('components') or {}
-            if comps:
-                break
-        except (OSError, ValueError):
-            continue
+    # the same document the weights came from: re-reading the file could pick up
+    # a different version and grade one run against two sets of weights
+    comps = doc.get('components') or {}
     traj_w = float((comps.get('traj_tests') or {}).get('weight', 0) or 0)
     g, results = (_t.__dict__, {})
     for name in weights:

@@ -39,6 +39,12 @@ STATE_DIR = pathlib.Path(os.environ.get("ATLAS_STATE_DIR", "/logs/artifacts/atla
 TRAJ_PATH = STATE_DIR / "agent_trajectory.json"
 END_ENV_PATH = STATE_DIR / "end_env.json"
 
+# Every server this task wires, written here by harness/build.py from the task's
+# own [task.metadata] list and the ports the light servers' entrypoint.sh serves.
+# A fixed list would silently skip any app a task uses beyond it: the hook would
+# never log that session out, so its state would be missing from the snapshot
+# the verifier grades.
+# HARNESS-GENERATED: APP_URLS
 APP_URLS = {
     "LightBudget": os.environ.get("LIGHTBUDGET_URL", "http://light-servers:9020/mcp"),
     "LightNotes": os.environ.get("LIGHTNOTES_URL", "http://light-servers:9015/mcp"),
@@ -47,6 +53,7 @@ APP_URLS = {
     "LightDrive": os.environ.get("LIGHTDRIVE_URL", "http://light-servers:9041/mcp"),
     "LightConfluence": os.environ.get("LIGHTCONFLUENCE_URL", "http://light-servers:9060/mcp"),
 }
+# END HARNESS-GENERATED
 
 
 # ---------------------------------------------------------------- trajectory

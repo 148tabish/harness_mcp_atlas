@@ -14,11 +14,29 @@ import re
 import shutil
 from pathlib import Path
 
-from .common import ROOT, die, say, write_json
+from .common import ROOT, TEMPLATES, die, say, write_json
 
-# the harness owns these; an imported folder must not carry them
+# The harness supplies these. An import drops the ones that match the harness
+# copy byte for byte and keeps any the task changed deliberately, because the
+# build prefers whatever the input folder carries.
 GENERATED_TESTS = {"Dockerfile", "Dockerfile.ecr", "docker-compose.yaml", "evaluate.sh",
                    "grade.py", "test.sh", "claims_lib.py", "ctrf_pytest_plugin.py", "_judge"}
+
+
+def _same_as_template(item: Path) -> bool:
+    mine = TEMPLATES / "tests" / item.name
+    if item.is_dir() or not mine.is_file():
+        return item.is_dir() and mine.is_dir() and _dir_same(item, mine)
+    return item.read_bytes() == mine.read_bytes()
+
+
+def _dir_same(a: Path, b: Path) -> bool:
+    names = {p.name for p in a.iterdir()} | {p.name for p in b.iterdir()}
+    for name in names:
+        x, y = a / name, b / name
+        if not (x.is_file() and y.is_file() and x.read_bytes() == y.read_bytes()):
+            return False
+    return True
 
 
 def _task_blocks(raw: str) -> str:
@@ -77,10 +95,17 @@ def main(argv: list[str] | None = None) -> int:
     shutil.copytree(ls / "world_data", dest / "world_data")
 
     (dest / "tests").mkdir()
+    kept_own = []
     for item in sorted((src / "tests").iterdir()):
-        if item.name in GENERATED_TESTS or item.name == "__pycache__":
+        if item.name == "__pycache__":
             continue
+        if item.name in GENERATED_TESTS:
+            if _same_as_template(item):
+                continue
+            kept_own.append(item.name)
         (shutil.copytree if item.is_dir() else shutil.copy2)(item, dest / "tests" / item.name)
+    if kept_own:
+        say(f"kept this task's own {', '.join(kept_own)} (differs from the harness copy)")
     shutil.copytree(src / "solution", dest / "solution",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 

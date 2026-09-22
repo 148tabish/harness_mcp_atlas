@@ -100,8 +100,13 @@ def model_of(trial: Path) -> str:
 AGENT_NAMES = {"openhands_bridge_agent:OpenHandsSDKBridge": "openhands-sdk"}
 
 
+MASK = "***"
+
+
 def _mask(text: str) -> str:
-    return "*" * len(text)
+    # fixed width on purpose: a run of stars as long as the original still tells
+    # a reader how deep this machine's directories were
+    return MASK
 
 
 def _mask_paths(node, roots):

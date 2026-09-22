@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import statistics
+import tomllib
 from pathlib import Path
 
 from .common import say, write_json
@@ -27,12 +28,14 @@ def _mcp_calls(trial: Path, mcp_names: list[str]) -> int:
 
 
 def _mcp_names(task_dir: Path) -> list[str]:
+    """The wired server names, parsed as TOML rather than matched as text."""
     try:
-        text = (task_dir / "task.toml").read_text()
-    except OSError:
+        with (task_dir / "task.toml").open("rb") as fh:
+            doc = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
         return []
-    return [ln.split('"')[1] for ln in text.splitlines()
-            if ln.startswith("name = ") and '"Light' in ln]
+    servers = (doc.get("environment") or {}).get("mcp_servers") or []
+    return [s["name"] for s in servers if isinstance(s, dict) and s.get("name")]
 
 
 def summarise(job: Path, task_dir: Path, threshold: float = 0.7) -> dict:
