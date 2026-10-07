@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import urllib.parse
 from typing import Any, Union
@@ -231,6 +232,55 @@ def fix_image_media_types(node: Any) -> int:
     return fixed
 
 
+_STOP_RE = re.compile(rb'"stop_reason"\s*:\s*"([a-z_]+)"')
+_BLOCK_RE = re.compile(rb'"content_block"\s*:\s*\{\s*"type"\s*:\s*"([a-z_]+)"')
+
+
+class StopReasonTap:
+    """Record why a response ended, without touching a byte of it.
+
+    A response that carries reasoning but no text and no tool call looks, to
+    the agent, like the model going silent. The API says why in `stop_reason`:
+    `end_turn`, `tool_use`, `max_tokens`, or `refusal` when a safety classifier
+    stopped the output. That field never reaches the trajectory, so it is read
+    here and logged - the reason and the block types only, never the content.
+    """
+
+    def __init__(self, request_id: str = "") -> None:
+        self.request_id = request_id
+        self._tail = b""
+        self.stop_reason = ""
+        self.blocks: list[str] = []
+
+    def feed(self, chunk: bytes) -> None:
+        # keep a short overlap so a field split across two chunks is still seen
+        buf = self._tail + chunk
+        for m in _BLOCK_RE.finditer(buf):
+            self.blocks.append(m.group(1).decode())
+        found = _STOP_RE.findall(buf)
+        if found:
+            self.stop_reason = found[-1].decode()
+        self._tail = buf[-160:]
+
+    def feed_json(self, body: bytes) -> None:
+        try:
+            doc = json.loads(body)
+        except ValueError:
+            return
+        self.stop_reason = str(doc.get("stop_reason") or "")
+        self.blocks = [str(b.get("type")) for b in doc.get("content") or [] if isinstance(b, dict)]
+
+    def log(self) -> None:
+        # _BLOCK_RE also matches a block's own start event, so collapse repeats
+        seen: list[str] = []
+        for b in self.blocks:
+            if not seen or seen[-1] != b:
+                seen.append(b)
+        level = logging.WARNING if self.stop_reason in ("refusal", "max_tokens", "") else logging.INFO
+        _LOG.log(level, "response stop_reason=%s blocks=%s request_id=%s",
+                 self.stop_reason or "unknown", ",".join(seen) or "none", self.request_id)
+
+
 def request_thinking(body: dict[str, Any]) -> bool:
     """Ask for the reasoning summary the trajectory records as `thought`.
 
@@ -413,6 +463,9 @@ async def _forward_non_streaming(
                 for k, v in upstream.headers.items()
                 if k.lower() not in STRIP_HEADERS_OUT
             }
+            tap = StopReasonTap(upstream.headers.get("request-id", ""))
+            tap.feed_json(upstream.content)
+            tap.log()
             return Response(
                 content=upstream.content,
                 status_code=upstream.status_code,
@@ -541,11 +594,15 @@ async def _stream_with_failover(
 
         if 200 <= upstream.status_code < 300:
 
+            tap = StopReasonTap(upstream.headers.get("request-id", ""))
+
             async def event_stream():
                 try:
                     async for chunk in upstream.aiter_bytes():
+                        tap.feed(chunk)
                         yield chunk
                 finally:
+                    tap.log()
                     await upstream_cm.__aexit__(None, None, None)
                     await client.aclose()
 

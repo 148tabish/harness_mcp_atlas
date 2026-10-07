@@ -165,8 +165,12 @@ def build(src: Path) -> Path:
 
     # ---- task.toml: harness boilerplate + the author's blocks + the wiring ----
     boiler = boiler.replace("{{CANARY}}", canary).replace("{{AGENT_TIMEOUT}}", str(timeout))
-    # the task's harbor name is always atlas/<uuid>, whatever the folder is called
-    author = re.sub(r'^name = ".*"$', f'name = "atlas/{task_uuid}"', author, count=1, flags=re.M)
+    # The task's harbor name must carry its uuid. An author name that already
+    # does (atlas/Author_some-task_<uuid>) is kept as written; anything else
+    # becomes atlas/<uuid>, whatever the folder is called.
+    current = re.search(r'^name = "([^"]*)"$', author, re.M)
+    if not (current and task_uuid in current.group(1)):
+        author = re.sub(r'^name = ".*"$', f'name = "atlas/{task_uuid}"', author, count=1, flags=re.M)
     (dest / "task.toml").write_text(boiler + "\n" + author + _mcp_servers(apps, ports))
 
     # ---- instruction: kept verbatim, with its own canary at the top if it has none ----
@@ -203,10 +207,19 @@ def build(src: Path) -> Path:
     for name in ("Dockerfile", "Dockerfile.ecr", "docker-compose.yaml"):
         if (tests / name).is_file():
             (tests / name).write_text(_stamp((tests / name).read_text(), canary))
+    # The author's copy wins over the harness's, directories included: a task that
+    # ships its own _judge/ replaces the template's whole, rather than merging
+    # into it and leaving a mix of the two graders.
     for item in sorted((src / "tests").iterdir()):
         if item.name == "__pycache__":
             continue
-        (shutil.copytree if item.is_dir() else shutil.copy2)(item, tests / item.name)
+        target = tests / item.name
+        if item.is_dir():
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(item, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        else:
+            shutil.copy2(item, target)
 
     # ---- solution: the oracle and the ground-truth world, graders only ----
     shutil.copytree(src / "solution", dest / "solution",

@@ -92,6 +92,7 @@ _EDITS = [
         # the registry also forces the string serializer for this model, which
         # collapses every message to text and drops the image parts
         llm_kwargs["force_string_serializer"] = False
+    if "glm" in model:
         # without a known output limit LiteLLM falls back to 4096, which truncates
         # a long tool call mid-arguments and leaves the agent looping on it
         llm_kwargs["max_output_tokens"] = 16384

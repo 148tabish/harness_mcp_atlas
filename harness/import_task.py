@@ -84,7 +84,11 @@ def main(argv: list[str] | None = None) -> int:
     dest.mkdir(parents=True)
 
     raw = (src / "task.toml").read_text()
-    (dest / "task.toml").write_text(_with_wired_servers(_task_blocks(raw), raw))
+    # schema_version sits above [task], so the block extraction alone would drop
+    # the contract version the task declares
+    version = re.search(r'^schema_version\s*=\s*"[^"]+"', raw, re.M)
+    header = (version.group(0) + "\n\n") if version else ""
+    (dest / "task.toml").write_text(header + _with_wired_servers(_task_blocks(raw), raw))
     shutil.copy2(src / "instruction.md", dest / "instruction.md")
 
     (dest / "environment").mkdir()
@@ -111,7 +115,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # keep the task's identity so a rebuild lands on the same uuid and canary
     canary = re.search(r"harbor-canary GUID ([0-9a-f-]{36})", raw)
-    uuid_m = re.search(r'name = "atlas/([0-9a-f-]{36})"', raw)
+    # the uuid is the last one in the task name, which may carry a slug before
+    # it (atlas/Author_some-task_<uuid>); matching only atlas/<uuid> missed those
+    # and the build then minted a fresh uuid and canary for an existing task
+    name_line = re.search(r'^name = "([^"]*)"', raw, re.M)
+    found = re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                       name_line.group(1)) if name_line else []
+    uuid_m = re.match(r"(.+)", found[-1]) if found else None
     if canary and uuid_m:
         write_json(dest / ".identity.json",
                    {"uuid": uuid_m.group(1), "canary": canary.group(1), "imported_from": str(src)})

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -101,9 +102,13 @@ def run(cmd: list[str] | str, cwd: Path | None = None, env: dict | None = None,
     a run's terminal and its .log carry the same thing.
     """
     shell = isinstance(cmd, str)
-    if not capture and _LOG_FILE is not None:
+    full_env = {**os.environ, **(env or {})}
+    if not capture and _LOG_FILE is not None and sys.stdout.isatty():
+        returncode = _run_on_pty(cmd, cwd, full_env, shell)
+        proc = subprocess.CompletedProcess(cmd, returncode, None, None)
+    elif not capture and _LOG_FILE is not None:
         popen = subprocess.Popen(
-            cmd, cwd=cwd, shell=shell, text=True, env={**os.environ, **(env or {})},
+            cmd, cwd=cwd, shell=shell, text=True, env=full_env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
         for line in popen.stdout:                       # type: ignore[union-attr]
             sys.stdout.write(line)
@@ -124,6 +129,68 @@ def run(cmd: list[str] | str, cwd: Path | None = None, env: dict | None = None,
         raise Failure(f"command failed (rc={proc.returncode}){where}: "
                       f"{cmd if shell else ' '.join(cmd)}{out}")
     return proc
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[=>]")
+
+
+def _final_frame(raw: bytes) -> str:
+    """The text a terminal would finally show for one line of pty output.
+
+    A pty turns each newline into \\r\\n, and a redrawn line arrives as frames
+    separated by \\r. So the trailing \\r goes first, then the last non-empty
+    frame is what was left on screen.
+    """
+    text = _ANSI.sub("", raw.decode(errors="replace")).rstrip("\r")
+    frames = [f.rstrip() for f in text.split("\r") if f.strip()]
+    return frames[-1] if frames else ""
+
+
+def _run_on_pty(cmd, cwd, env, shell) -> int:
+    """Run `cmd` on a pseudo-terminal: live output on screen, clean text in the log.
+
+    Harbor draws trial progress with rich, which renders live bars only when its
+    output is a terminal. Piping it into the log made rich switch them off, so a
+    run showed nothing between start and finish. On a pty rich sees a terminal
+    and draws as it would bare; the bytes go to the screen unchanged, and the
+    log gets them with colour codes and cursor redraws removed, keeping only the
+    final text of each redrawn line and dropping repeats.
+    """
+    import fcntl, pty, select, struct, termios
+    master, slave = pty.openpty()
+    cols, rows = shutil.get_terminal_size((160, 48))
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    popen = subprocess.Popen(cmd, cwd=cwd, shell=shell, env=env, stdin=subprocess.DEVNULL,
+                             stdout=slave, stderr=slave, close_fds=True)
+    os.close(slave)
+    pending, last_logged = b"", ""
+    try:
+        while True:
+            ready, _, _ = select.select([master], [], [], 0.5)
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:          # the child closed its side: EIO on Linux
+                    data = b""
+                if not data:
+                    break
+                sys.stdout.buffer.write(data)
+                sys.stdout.flush()
+                pending += data
+                *lines, pending = pending.split(b"\n")
+                for raw in lines:
+                    text = _final_frame(raw)
+                    if text and text != last_logged:
+                        _mirror(text)
+                        last_logged = text
+            elif popen.poll() is not None:
+                break
+    finally:
+        os.close(master)
+    tail = _final_frame(pending)
+    if tail and tail != last_logged:
+        _mirror(tail)
+    return popen.wait()
 
 
 def read_env_file(path: Path) -> dict[str, str]:
