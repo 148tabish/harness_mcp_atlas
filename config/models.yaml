@@ -3,6 +3,11 @@
 #   route: claude  -> vendor/harness-levi-bridge (Claude Code OAuth), port 8765
 #   route: zai     -> vendor/zbridge (z.ai GLM Coding Plan), port 8766
 #
+# `base_url` is the bridge as the task containers reach it: host.docker.internal,
+# which Docker Desktop resolves itself and the compose template aliases to the docker0
+# gateway on a Linux engine (extra_hosts host-gateway). `health` is the same bridge as
+# this host reaches it; the bridges bind 0.0.0.0, so loopback works on both OSes.
+#
 # `model` is what harbor gets after -m. The provider prefix stays "anthropic/"
 # on both routes: the agent talks the Anthropic /v1/messages shape and each
 # bridge translates from there.
@@ -37,19 +42,33 @@ routes:
   claude:
     dir: vendor/harness-levi-bridge
     start: ./claude_code_bridge.sh start
-    health: http://172.17.0.1:8765/healthz
-    base_url: http://172.17.0.1:8765
+    health: http://127.0.0.1:8765/healthz
+    base_url: http://host.docker.internal:8765
     api_key: sk-ant-oauth-bridge-stub
   zai:
     dir: vendor/zbridge
     start: ./zbridge.sh start
-    health: http://172.17.0.1:8766/healthz
-    base_url: http://172.17.0.1:8766
+    health: http://127.0.0.1:8766/healthz
+    base_url: http://host.docker.internal:8766
     api_key_from_env: ZB_BRIDGE_SECRET   # read from vendor/zbridge/.env
 
 defaults:
+  model: opus-5          # --model; the agent the trajectories are produced with
   attempts: 8            # -k
   concurrent: 2          # -n
   retries: 2             # -r
+  # harbor gives the agent 360 s to install its SDK inside the container, downloaded afresh
+  # per trial (~100+ MB). 3x covers an ordinary link; a slow one needs --setup-timeout-multiplier.
+  agent_setup_timeout_multiplier: 3
   effort: high           # --effort low|high; high keeps thinking in the trajectory
+  # The rubric judge Rewardkit runs in the verifier. --judge-model and JUDGE_MODEL in
+  # .env override judge_model; the value used is recorded in every run's judge.json.
+  # transport: codex (the Codex CLI with the ChatGPT login in ~/.codex/auth.json) or
+  # claude-code (the Claude Code CLI with CLAUDE_CODE_OAUTH_TOKEN).
+  # Which models a ChatGPT login may run depends on the plan behind it: a Pro login
+  # (plan "promax" in ~/.codex/auth.json) accepts gpt-5.6-sol, terra and luna; a Plus
+  # login accepts terra and luna only and refuses gpt-5.5, gpt-5.6 and gpt-5.6-sol
+  # (400 "not supported when using Codex with a ChatGPT account"). setup.sh probes the
+  # configured model against the current login.
   judge_model: gpt-5.6-sol
+  judge_transport: codex

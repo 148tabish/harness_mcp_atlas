@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .common import HARBOR_BIN, JOBS_DIR, Failure, run, say
+from .common import HARBOR_BIN, JOBS_DIR, VENDOR, Failure, run, say
 
 
 def _started(trial: Path) -> str:
@@ -25,18 +25,17 @@ def _started(trial: Path) -> str:
         return ""
 
 
-def regrade(job: Path, task_dir: Path, judge_model: str,
-            codex_auth: str | None = None) -> Path:
-    """Regrade every trial in `job`; return the new job folder."""
+def regrade(job: Path, task_dir: Path, judge_env: dict[str, str]) -> Path:
+    """Regrade every trial in `job` with the verifier env `judge_env`; return the new job folder."""
     trials = sorted((p for p in job.iterdir() if p.is_dir()), key=_started)
     if not trials:
         raise Failure(f"no trials in {job}")
     dest = JOBS_DIR / f"{job.name}-regraded"
     dest.mkdir(parents=True, exist_ok=True)
 
-    env = {"JUDGE_MODEL": judge_model}
-    if codex_auth:
-        env["CODEX_AUTH_B64"] = codex_auth
+    # the trial's config names the bridge agent class; harbor imports it even though
+    # the agent never runs again, so it must be importable here as in a live run
+    env = {**judge_env, "PYTHONPATH": str(VENDOR / "harness-levi-bridge" / "harbor_agent")}
     say(f"regrading {len(trials)} trials from {job.name} -> {dest.name}")
     for trial in trials:
         name = trial.name

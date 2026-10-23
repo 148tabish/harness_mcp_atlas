@@ -6,15 +6,18 @@ at a model's output, and nothing here can change a score.
 from __future__ import annotations
 
 import json
+import os
 import re
 import tomllib
 from pathlib import Path
 
-from . import gates
+from . import gates, server_patches
 from .common import BUILD_DIR, Failure, say
+from .judge_compile import compile_judge
+from .weights import GUARD_POLARITIES, rubric_file, tests_of
 
 REQUIRED_FILES = ["instruction.md", "task.toml", "tests/test_outputs.py",
-                  "tests/rubric.json", "tests/test_weights.json",
+                  "tests/test_weights.json",
                   "tests/oracle.json", "environment/Dockerfile",
                   # the oracle, the world it produces and the answer it states:
                   # a solution/ that only exists as a directory cannot be replayed
@@ -24,9 +27,73 @@ REQUIRED_DIRS = ["data", "world_data", "solution"]
 # a world overlay with one placeholder file is an empty world with extra steps
 MIN_WORLD_FILES = 2
 
+# The rubric: tests/judge.toml ([[criterion]] tables, the authoring format) or the
+# older tests/rubric.json ({"criteria": [...]}). Either is compiled for the judge at build.
+
+# Provenance and contamination records are CRUCIBLE policy, not task format. They
+# refuse the build only when ATLAS_STRICT_PROVENANCE=1; otherwise they are said
+# out loud and the task builds, so a task can be run before its paperwork lands.
+STRICT_PROVENANCE = os.environ.get("ATLAS_STRICT_PROVENANCE", "") == "1"
+
 # blocks the harness owns; an author who writes them would be overridden silently
 HARNESS_OWNED = ["[agent]", "[verifier]", "[verifier.env]", "[verifier.environment]",
                  "[[verifier.collect]]", "[environment]", "[[environment.mcp_servers]]"]
+
+
+def _copy_case_mismatches(context: Path) -> list[str]:
+    """COPY/ADD sources in context/Dockerfile that exist only up to letter case."""
+    import fnmatch
+    import shlex
+    dockerfile = context / "Dockerfile"
+    if not dockerfile.is_file():
+        return []
+    out: list[str] = []
+    text = dockerfile.read_text().replace("\\\n", " ")
+    for line in text.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2 or parts[0].upper() not in ("COPY", "ADD"):
+            continue
+        rest = parts[1]
+        if rest.lstrip().startswith("["):                     # JSON form
+            try:
+                import json
+                args = json.loads(rest)
+            except ValueError:
+                continue
+        else:
+            args = shlex.split(rest)
+        if any(a.startswith("--from=") for a in args):      # another build stage
+            continue
+        sources = [a for a in args if not a.startswith("--")][:-1]
+        for pattern in sources:
+            if pattern.startswith(("http://", "https://")):
+                continue
+            exact = _exists_exact(context, pattern, fnmatch)
+            if exact is False:
+                out.append(f"environment/Dockerfile copies {pattern!r}, which exists only in a "
+                           f"different letter case (fine on a Mac, a build error on Linux)")
+    return out
+
+
+def _exists_exact(root: Path, pattern: str, fnmatch) -> bool | None:
+    """True if `pattern` (a path, maybe with globs) matches with exact case, False if it
+    matches only case-insensitively, None if nothing matches either way."""
+    parts = [p for p in pattern.strip("/").split("/") if p and p != "."]
+    exact_hits, loose_hits = [root], [root]
+    for part in parts:
+        nxt_exact, nxt_loose = [], []
+        for d in exact_hits:
+            if d.is_dir():
+                nxt_exact += [d / n for n in sorted(e.name for e in d.iterdir()) if fnmatch.fnmatchcase(n, part)]
+        for d in loose_hits:
+            if d.is_dir():
+                nxt_loose += [d / n for n in sorted(e.name for e in d.iterdir()) if fnmatch.fnmatchcase(n.lower(), part.lower())]
+        exact_hits, loose_hits = nxt_exact, nxt_loose
+        if not loose_hits:
+            return None
+    if exact_hits:
+        return True
+    return False if loose_hits else None
 
 
 def validate(src: Path) -> dict:
@@ -81,6 +148,15 @@ def validate(src: Path) -> dict:
                             'its blocks are written against, e.g. "1.4")')
 
     # tests
+    if not rubric_file(src):
+        problems.append("missing file: tests/judge.toml (or the older tests/rubric.json)")
+    elif (src / "tests" / "judge.toml").is_file() and (src / "tests" / "rubric.json").is_file():
+        # the build compiles judge.toml and the older verifier used rubric.json, so a task
+        # shipping both can be judged against whichever is the leftover of another task
+        # (8522713f: a foreign judge.toml beside its own rubric.json scored its oracle 0.0)
+        problems.append("tests/judge.toml and tests/rubric.json both present: keep the one that "
+                        "is this task's rubric (the build compiles judge.toml; the task's own "
+                        "verifier used rubric.json)")
     weights_path = src / "tests" / "test_weights.json"
     if weights_path.is_file():
         try:
@@ -88,44 +164,68 @@ def validate(src: Path) -> dict:
         except json.JSONDecodeError as exc:
             problems.append(f"tests/test_weights.json does not parse: {exc}")
         else:
-            components = weights.get("components") or {}
-            traj = (components.get("traj_tests") or {}).get("tests") or {}
+            # flat {"tests": {name: weight}} (the authoring format) or the older
+            # {"components": {"traj_tests": {"tests": {...}}}}; weights_of reads both
+            traj = tests_of(weights)
             if not traj:
-                problems.append("tests/test_weights.json has no components.traj_tests.tests")
-            if not (components.get("rubric") or {}).get("file"):
-                problems.append("tests/test_weights.json has no components.rubric.file")
+                problems.append('tests/test_weights.json has no "tests" map '
+                                "(nor components.traj_tests.tests)")
+            bad = {n: w for n, w in traj.items() if not isinstance(w, (int, float)) or w == 0}
+            for name, w in sorted(bad.items()):
+                problems.append(f"tests/test_weights.json gives {name} the weight {w!r}; "
+                                f"weights are non-zero numbers (negative = guard)")
             # the reward a run that does nothing must not clear: without it stated,
             # nobody can say what score an empty submission would have earned
             if weights.get("null_floor") is None:
                 problems.append("tests/test_weights.json has no null_floor: the reward an "
                                 "empty submission scores, which a real run must beat")
+            th = weights.get("threshold")
+            if th is not None and not (isinstance(th, (int, float)) and 0 < th <= 1):
+                problems.append(f"tests/test_weights.json threshold {th!r} is not in (0, 1]")
+            gp = weights.get("guard_polarity", "fail_charges")
+            if gp not in GUARD_POLARITIES:
+                problems.append(f"tests/test_weights.json guard_polarity {gp!r} is not one of "
+                                f"{GUARD_POLARITIES}")
+            # Two guard conventions exist: a guard that asserts the rule held (charged when
+            # it fails) and one that asserts the misbehaviour happened (charged when it
+            # passes). Read the wrong way, every clean run is charged every guard.
+            if any(w < 0 for w in traj.values() if isinstance(w, (int, float))) \
+                    and "guard_polarity" not in weights:
+                say('WARNING tests/test_weights.json has guards but no "guard_polarity"; '
+                    'assuming "fail_charges" (a guard is charged when it fails). A guard that '
+                    'passes when the misbehaviour is detected needs "pass_charges".')
             named = set(traj)
             if (src / "tests" / "test_outputs.py").is_file():
                 body = (src / "tests" / "test_outputs.py").read_text()
-                defined = set(re.findall(r"^def (test_\w+)", body, re.M))
+                # pytest collects module-level callables by attribute name, so a test
+                # bound by assignment (test_sheet_gpu_a100 = _sheet_test("gpu-a100"),
+                # eeafd50a) counts as defined too
+                defined = set(re.findall(r"^def (test_\w+)", body, re.M)) \
+                    | set(re.findall(r"^(test_\w+)\s*=", body, re.M))
                 for miss in sorted(defined - named):
                     problems.append(f"test_outputs.py defines {miss} but it carries no weight")
+                # a module that mints tests at import time (globals()["test_%s" % k] = _mk(k),
+                # c5ff46fc) cannot be enumerated without running it; the oracle calibration is
+                # the check that every weighted name is collected, so here it is a warning
+                dynamic = re.search(r'globals\(\)\s*\[\s*["\']test_', body) is not None
                 for extra in sorted(named - defined):
-                    problems.append(f"test_weights.json weights {extra}, which no test defines")
-    rubric_path = src / "tests" / "rubric.json"
-    if rubric_path.is_file():
-        try:
-            rubric = json.loads(rubric_path.read_text())
-        except json.JSONDecodeError as exc:
-            problems.append(f"tests/rubric.json does not parse: {exc}")
-        else:
-            criteria = rubric.get("criteria") or []
-            if not criteria:
-                problems.append("tests/rubric.json carries no criteria")
-            # the judge reads these four; a criterion missing one is scored blind
-            for i, c in enumerate(criteria, 1):
-                if not isinstance(c, dict):
-                    problems.append(f"tests/rubric.json criterion {i} is not an object")
-                    continue
-                for field in ("criterion", "importance", "is_positive"):
-                    if field not in c:
-                        problems.append(f"tests/rubric.json criterion {i} "
-                                        f"({str(c.get('criterion', ''))[:40]}) has no {field}")
+                    msg = f"test_weights.json weights {extra}, which no test defines"
+                    if dynamic:
+                        say(f"WARNING {msg} statically (tests are minted via globals(); "
+                            f"the oracle run must collect it)")
+                    else:
+                        problems.append(msg)
+    if rubric_file(src):
+        # the file the verifier runs is compiled from this one; anything the compiler
+        # would refuse is refused here, before a build and a paid run
+        _, judge_problems = compile_judge(rubric_file(src))
+        problems += [f"tests/{rubric_file(src).name}: {p}" for p in judge_problems]
+    # the verifier is the harness's; an author copy is skipped at build, so say so here
+    from .build import HARNESS_VERIFIER
+    shipped = sorted(p.name for p in (src / "tests").iterdir()
+                     if p.name in HARNESS_VERIFIER) if (src / "tests").is_dir() else []
+    if shipped:
+        say(f"WARNING tests/ ships verifier files the build will not use: {', '.join(shipped)}")
 
     # A floating tag rebuilds into a different image months later, so a run can
     # never be reproduced and two runs cannot be compared.
@@ -135,6 +235,19 @@ def validate(src: Path) -> dict:
             if line.strip().upper().startswith("FROM ") and "@sha256:" not in line:
                 problems.append(f"environment/Dockerfile is not pinned to a digest: "
                                 f"{line.strip()[:60]}")
+
+    # A Mac's default filesystem ignores case, a Linux one does not: a COPY whose source
+    # is spelled differently from the file on disk builds here and fails on the EC2.
+    problems += _copy_case_mismatches(src / "environment")
+
+    # the author's server patches: only server code is copied over the vendor tree
+    patch_problems, patch_warnings = server_patches.check(src)
+    problems += patch_problems
+    for line in patch_warnings:
+        say(f"WARNING {line}")
+    for rel in server_patches.patches(src):
+        if server_patches.allowed(rel):
+            say(f"server patch: environment/light-servers/{rel}")
 
     # The grader pulls helpers out of test_outputs at import time. A name it needs
     # and the tests do not define aborts it inside the verifier, which leaves no
@@ -162,8 +275,12 @@ def validate(src: Path) -> dict:
     problems += gates.containment(src)
 
     # what the bundle claims about where it came from and what it was screened against
-    problems += gates.provenance(data)
-    problems += gates.contamination_screen(src, data)
+    paperwork = gates.provenance(data) + gates.contamination_screen(src, data)
+    if STRICT_PROVENANCE:
+        problems += paperwork
+    else:
+        for line in paperwork:
+            say(f"WARNING (not enforced; set ATLAS_STRICT_PROVENANCE=1 to refuse): {line}")
     problems += gates.collision(src, BUILD_DIR.parent / "task_registry.json")
 
     if problems:

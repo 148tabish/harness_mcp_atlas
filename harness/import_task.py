@@ -14,36 +14,28 @@ import re
 import shutil
 from pathlib import Path
 
-from .common import ROOT, TEMPLATES, die, say, write_json
+from . import server_patches
+from .build import HARNESS_BLOCKS, HARNESS_VERIFIER
+from .common import ROOT, die, say, write_json
+from .judge_compile import decompile_toml
 
-# The harness supplies these. An import drops the ones that match the harness
-# copy byte for byte and keeps any the task changed deliberately, because the
-# build prefers whatever the input folder carries.
-GENERATED_TESTS = {"Dockerfile", "Dockerfile.ecr", "docker-compose.yaml", "evaluate.sh",
-                   "grade.py", "test.sh", "claims_lib.py", "ctrf_pytest_plugin.py", "_judge"}
-
-
-def _same_as_template(item: Path) -> bool:
-    mine = TEMPLATES / "tests" / item.name
-    if item.is_dir() or not mine.is_file():
-        return item.is_dir() and mine.is_dir() and _dir_same(item, mine)
-    return item.read_bytes() == mine.read_bytes()
-
-
-def _dir_same(a: Path, b: Path) -> bool:
-    names = {p.name for p in a.iterdir()} | {p.name for p in b.iterdir()}
-    for name in names:
-        x, y = a / name, b / name
-        if not (x.is_file() and y.is_file() and x.read_bytes() == y.read_bytes()):
-            return False
-    return True
+# The verifier is the harness's and the build never takes an author copy of it (see
+# build.HARNESS_VERIFIER), so an import leaves those files behind instead of carrying
+# a stale verifier that validate would then warn about on every run.
+GENERATED_TESTS = set(HARNESS_VERIFIER)
 
 
 def _task_blocks(raw: str) -> str:
+    """The author's [task] and [task.metadata] text, up to the first harness-owned block.
+
+    A built task.toml carries the generated [[environment.mcp_servers]] list after the
+    author's blocks (and may carry nothing else); stopping only at [agent] / [verifier] /
+    [environment] copied that list into the input, which validate then refused.
+    """
     lines = raw.splitlines()
     start = next(i for i, ln in enumerate(lines) if ln.strip() == "[task]")
     stop = next((i for i, ln in enumerate(lines[start:], start)
-                 if ln.strip() in ("[agent]", "[verifier]", "[environment]")), len(lines))
+                 if ln.strip() in HARNESS_BLOCKS), len(lines))
     return "\n".join(lines[start:stop]).rstrip() + "\n"
 
 
@@ -97,19 +89,50 @@ def main(argv: list[str] | None = None) -> int:
     ls = src / "environment" / "light-servers"
     shutil.copytree(ls / "task_data", dest / "data")
     shutil.copytree(ls / "world_data", dest / "world_data")
+    # server code the author changed travels as a patch; a corpus or data difference
+    # does not (the build cannot reproduce it: world changes belong in world_data/)
+    carried, left = server_patches.extract(ls, dest)
+    if carried:
+        say(f"server patches carried: {', '.join(carried)}")
+    for rel in left:
+        say(f"WARNING {rel} differs from vendor/light-servers and is not server code; "
+            f"the rebuilt task serves the vendor copy")
 
     (dest / "tests").mkdir()
-    kept_own = []
+    dropped = []
     for item in sorted((src / "tests").iterdir()):
         if item.name == "__pycache__":
             continue
         if item.name in GENERATED_TESTS:
-            if _same_as_template(item):
-                continue
-            kept_own.append(item.name)
-        (shutil.copytree if item.is_dir() else shutil.copy2)(item, dest / "tests" / item.name)
-    if kept_own:
-        say(f"kept this task's own {', '.join(kept_own)} (differs from the harness copy)")
+            dropped.append(item.name)
+            # an author module that only shares the harness library's name is not the
+            # harness's: dropping it silently leaves test_outputs.py importing the wrong API
+            # (310e65cb shipped its own claims_lib.py: load_fixture(env, name), end_env(),
+            # captured(), by_key(); the harness's has none of those)
+            template = ROOT / "templates" / "tests" / item.name
+            # only code modules: the stamped files (test.sh, Dockerfile, compose) always differ
+            if item.suffix == ".py" and item.is_file() and template.is_file() \
+                    and item.read_bytes() != template.read_bytes():
+                say(f"WARNING tests/{item.name} differs from the harness's templates/tests/{item.name} "
+                    f"and is dropped; if test_outputs.py relies on the author's version, carry it "
+                    f"under another name (e.g. tests/task_lib.py) and change the import")
+            continue
+        if item.is_dir():
+            shutil.copytree(item, dest / "tests" / item.name,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        else:
+            shutil.copy2(item, dest / "tests" / item.name)
+    if dropped:
+        say(f"left the built task's verifier behind (the harness supplies its own): "
+            f"{', '.join(dropped)}")
+    if (dest / "tests" / "judge.toml").is_file() and (dest / "tests" / "rubric.json").is_file():
+        say("WARNING tests/judge.toml and tests/rubric.json both present; validate will refuse "
+            "until one is removed (the task's own verifier used rubric.json)")
+    # a task built since 2026-10-22 ships the rubric only in its compiled form
+    compiled = src / "tests" / "reward" / "rubric" / "judge.toml"
+    if compiled.is_file() and not any((dest / "tests" / n).is_file() for n in ("judge.toml", "rubric.json")):
+        (dest / "tests" / "judge.toml").write_text(decompile_toml(compiled.read_text()))
+        say("tests/judge.toml reconstructed from the compiled rubric")
     shutil.copytree(src / "solution", dest / "solution",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 

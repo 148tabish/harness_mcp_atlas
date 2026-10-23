@@ -7,8 +7,22 @@
 #
 #   bash calibrate.sh <task-uuid> <oracle|nop> <job-name>
 set -euo pipefail
-H="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+H="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; export H
 TASK=$1 AGENT=$2 JOB=$3
-export CODEX_AUTH_B64="$(base64 -w0 ~/.codex/auth.json)" JUDGE_MODEL=gpt-5.6-sol
+# the judge env exactly as a real run gets it: model and transport from .env / models.yaml,
+# the codex login base64-encoded (a missing login only leaves the rubric channel unscored)
+[ -f "$H/.env" ] && { set -a; . "$H/.env"; set +a; }
+eval "$("$H/.venv/bin/python" - <<'PYEOF'
+import os, shlex, sys
+sys.path.insert(0, os.environ["H"])
+from harness.common import load_models
+from harness.runjob import judge_env
+d = load_models().get("defaults") or {}
+model = os.environ.get("JUDGE_MODEL") or str(d.get("judge_model") or "")
+transport = os.environ.get("JUDGE_TRANSPORT") or str(d.get("judge_transport") or "codex")
+for k, v in judge_env(model, transport).items():
+    print(f"export {k}={shlex.quote(v)}")
+PYEOF
+)"
 cd "$H/out"
 exec "$H/.venv/bin/harbor" run -p "$H/out/build/$TASK" -a "$AGENT" -k 1 -n 1 -y --job-name "$JOB"
