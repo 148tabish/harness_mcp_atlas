@@ -204,6 +204,16 @@ def patched_runner() -> str:
 
 
 class OpenHandsSDKBridge(OpenHandsSDK):
+    async def exec_as_root(self, environment: BaseEnvironment, command: str, **kw):
+        # harbor's install() runs `chown {user}:{user} /opt/openhands-sdk-venv`. A task
+        # that names the agent user as "uid:gid" (the harness tasks carry 10001:10001)
+        # would hand chown "10001:10001:10001:10001"; pass the pair through unchanged.
+        # Kept here so harbor itself needs no patch.
+        user = str(environment.default_user or "root")
+        if ":" in user:
+            command = command.replace(f"chown {user}:{user} ", f"chown {user} ")
+        return await super().exec_as_root(environment, command, **kw)
+
     async def install(self, environment: BaseEnvironment) -> None:
         await super().install(environment)
         local_copy = self.logs_dir / "run_agent.py"

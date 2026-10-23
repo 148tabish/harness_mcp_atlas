@@ -34,34 +34,132 @@ elif command -v uv >/dev/null 2>&1 && uv python find 3.12 >/dev/null 2>&1; then
 else
     bad "python 3.12 not available (install it, or let uv fetch one: uv python install 3.12)"
 fi
-avail=$(df -BG --output=avail "$HERE" | tail -1 | tr -dc '0-9')
+if df -BG --output=avail "$HERE" >/dev/null 2>&1; then
+    avail=$(df -BG --output=avail "$HERE" | tail -1 | tr -dc '0-9')     # GNU coreutils
+else
+    avail=$(df -g "$HERE" | awk 'NR==2 {print $4}')                      # BSD/macOS, 1G blocks
+fi
 [ "${avail:-0}" -ge 40 ] && ok "disk ${avail}G free" || warn "only ${avail}G free; 40G+ recommended"
 for port in 8765 8766; do
-    if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$port "; then
+    if { command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ":$port "; } \
+       || { command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; }; then
         warn "port $port already in use (a bridge may already be running)"
     else
         ok "port $port free"
     fi
 done
 
+echo "== host"
+OS=$(uname -s); ARCH=$(uname -m)
+case "$ARCH" in x86_64|amd64) PLATFORM=linux/amd64 ;; arm64|aarch64) PLATFORM=linux/arm64 ;; *) PLATFORM="linux/$ARCH" ;; esac
+ok "$OS $ARCH; images are pulled for $PLATFORM"
+# The task containers reach the bridges as host.docker.internal; a Linux engine gets
+# that name from the compose template's extra_hosts host-gateway (engine 20.10+).
+ENGINE=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 0)
+if python3 -c 'import sys; v=tuple(int(x) for x in sys.argv[1].split("-")[0].split(".")[:2]); raise SystemExit(0 if v >= (20,10) else 1)' "$ENGINE" 2>/dev/null; then
+    ok "docker engine $ENGINE ($(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2>/dev/null), host-gateway supported)"
+else
+    bad "docker engine $ENGINE is older than 20.10: no host-gateway alias, task containers cannot reach the bridges"
+fi
+if [ "$CHECK_ONLY" = 1 ] || [ -n "${HARNESS_PROBE_GATEWAY:-}" ]; then
+    # the real thing: a container resolving the alias (pulls a 3 MB image once)
+    if docker run --rm --add-host host.docker.internal:host-gateway alpine:3.20 sh -c 'getent hosts host.docker.internal' >/dev/null 2>&1; then
+        ok "a container resolves host.docker.internal"
+    else
+        warn "a container could not resolve host.docker.internal (offline, or an engine without host-gateway)"
+    fi
+fi
+# resources as the engine sees them: the Docker Desktop VM on a Mac, the machine on Linux
+NCPU=$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 0)
+MEMGB=$(( $(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0) / 1073741824 ))
+CONC=$(sed -n 's/^ *concurrent: *\([0-9]*\).*/\1/p' "$HERE/config/models.yaml" | head -1); CONC=${CONC:-2}
+# a trial with ~30 light servers takes ~2 GB and a core; the separate verifier and the
+# judge another ~2 GB; the bridges and the OS the rest
+NEED_GB=$(( CONC * 3 + 4 )); NEED_CPU=$(( CONC * 2 ))
+if [ "$NCPU" -ge "$NEED_CPU" ] && [ "$MEMGB" -ge "$NEED_GB" ]; then
+    ok "docker has $NCPU CPUs, ${MEMGB} GB: enough for $CONC concurrent trials"
+else
+    warn "docker has $NCPU CPUs, ${MEMGB} GB; $CONC concurrent trials want ~$NEED_CPU CPUs, ~${NEED_GB} GB (lower -n / defaults.concurrent, or raise Docker Desktop's resources)"
+fi
+command -v codex >/dev/null 2>&1 && ok "codex CLI $(codex --version 2>/dev/null | awk '{print $NF}')" || warn "codex CLI not installed on the host (only setup's judge-model probe needs it; the verifier has its own)"
+# every pinned base image the harness builds from must exist for this platform; the
+# ECR variants (Dockerfile.ecr) are linux/amd64 only and are not checked here
+for df in "$HERE/templates/tests/Dockerfile" "$HERE/vendor/light-servers/Dockerfile"; do
+    for ref in $(sed -n 's/^FROM \([^ ]*@sha256:[0-9a-f]*\).*/\1/p' "$df" | sort -u); do
+        # variants count (linux/arm64/v8 is linux/arm64); attestation entries (unknown/unknown) do not
+        if plats=$(docker buildx imagetools inspect "$ref" 2>/dev/null | sed -n 's/^ *Platform: *//p' | grep -v '^unknown'); then
+            if printf '%s\n' "$plats" | grep -qE "^${PLATFORM}(/|$)"; then ok "${df#$HERE/}: ${ref%%@*} has $PLATFORM"
+            else bad "${df#$HERE/}: ${ref%%@*} (pinned digest) has no $PLATFORM build, only: $(printf '%s ' $plats)"; fi
+        else
+            warn "${df#$HERE/}: could not inspect ${ref%%@*} (offline?)"
+        fi
+    done
+done
+
 echo "== credentials"
-[ -s "${CODEX_HOME:-$HOME/.codex}/auth.json" ] \
-    && ok "codex login present (rubric channel will be scored)" \
-    || warn "no ~/.codex/auth.json: the rubric channel stays UNSCORED; run 'codex login'"
+# The rubric judge: Rewardkit runs it through the codex CLI (ChatGPT login) or the
+# claude-code CLI. The model is JUDGE_MODEL (.env) or config/models.yaml; a ChatGPT
+# login refuses some models (the gpt-5.x-sol family), so the chosen one is tried here.
+JUDGE_MODEL="${JUDGE_MODEL:-$(sed -n 's/^ *judge_model: *//p' "$HERE/config/models.yaml" | head -1)}"
+JUDGE_TRANSPORT="${JUDGE_TRANSPORT:-$(sed -n 's/^ *judge_transport: *//p' "$HERE/config/models.yaml" | head -1)}"
+if [ "${JUDGE_TRANSPORT:-codex}" = codex ]; then
+    if [ -s "${CODEX_HOME:-$HOME/.codex}/auth.json" ]; then
+        ok "codex login present (rubric channel will be scored)"
+        if command -v codex >/dev/null 2>&1 && [ -n "$JUDGE_MODEL" ]; then
+            # stdin closed: codex exec waits on an open stdin and would hang here
+            if python3 - "$JUDGE_MODEL" <<'PYEOF' >/dev/null 2>&1
+import subprocess, sys
+r = subprocess.run(["codex", "exec", "--skip-git-repo-check", "-m", sys.argv[1], "reply with the single word ok"],
+                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+raise SystemExit(0 if r.returncode == 0 else 1)
+PYEOF
+            then ok "judge model $JUDGE_MODEL accepted by the codex login"
+            else warn "judge model $JUDGE_MODEL refused by codex (try another JUDGE_MODEL in .env; the rubric channel would stay UNSCORED)"
+            fi
+        elif [ -z "$JUDGE_MODEL" ]; then
+            warn "no judge model: set JUDGE_MODEL in .env or defaults.judge_model in config/models.yaml"
+        fi
+    else
+        warn "no ~/.codex/auth.json: the rubric channel stays UNSCORED; run 'codex login' (or 'codex login --device-auth' headless)"
+    fi
+elif [ "$JUDGE_TRANSPORT" = claude-code ]; then
+    [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && ok "claude-code judge: CLAUDE_CODE_OAUTH_TOKEN set" \
+        || warn "JUDGE_TRANSPORT=claude-code needs CLAUDE_CODE_OAUTH_TOKEN in .env (claude setup-token)"
+else
+    warn "JUDGE_TRANSPORT=$JUDGE_TRANSPORT is not codex or claude-code"
+fi
 [ -s "$HERE/vendor/zbridge/.env" ] && ok "zbridge .env present" || warn "vendor/zbridge/.env missing (GLM route)"
-[ -s "$HOME/.claude/.credentials.json" ] || [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
-    && ok "claude credentials present" || warn "no Claude login found (opus-5 route)"
+# the claude CLI keeps its login in ~/.claude/.credentials.json on Linux and in the
+# Keychain on macOS; the bridge reads either
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+    ok "claude login: CLAUDE_CODE_OAUTH_TOKEN (token login, works headless on either OS)"
+elif [ -s "$HOME/.claude/.credentials.json" ]; then
+    ok "claude login: ~/.claude/.credentials.json"
+elif command -v security >/dev/null 2>&1 && security find-generic-password -s "Claude Code-credentials" >/dev/null 2>&1; then
+    ok "claude login: macOS Keychain (set AURORA_CC_WRITE_BACK_KEYCHAIN=1 in .env so refreshes are written back)"
+elif false; then
+    :
+else
+    warn "no Claude login found (opus-5 route): run 'claude' once and log in"
+fi
 
 [ "$CHECK_ONLY" = 1 ] && { echo; [ "$fail" = 0 ] && echo "ready" || echo "missing prerequisites above"; exit $fail; }
 [ "$fail" = 0 ] || { echo; echo "fix the MISS lines above, then re-run"; exit 1; }
 
 echo "== harbor venv"
-if [ -x "$HERE/.venv/bin/harbor" ]; then
-    ok "harbor $("$HERE/.venv/bin/harbor" --version 2>/dev/null)"
+# vendor/ carries exactly one harbor tree; the venv must hold that version. An
+# older install (or none) is rebuilt, so bumping the vendored tree is one re-run.
+HARBOR_SRC=$(ls -d "$HERE"/vendor/harbor-*/ | head -1); HARBOR_SRC=${HARBOR_SRC%/}
+WANT=$(sed -n 's/^version = "\(.*\)"/\1/p' "$HARBOR_SRC/pyproject.toml")
+HAVE=""; [ -x "$HERE/.venv/bin/harbor" ] && HAVE=$("$HERE/.venv/bin/harbor" --version 2>/dev/null || true)
+if [ -n "$HAVE" ] && [ "$HAVE" = "$WANT" ]; then
+    ok "harbor $HAVE"
 else
+    [ -n "$HAVE" ] && echo "   harbor $HAVE installed, ${HARBOR_SRC#$HERE/} carries $WANT: rebuilding .venv"
+    rm -rf "$HERE/.venv"
     uv venv "$HERE/.venv" --python 3.12 >/dev/null
-    uv pip install --python "$HERE/.venv/bin/python" -e "$HERE/vendor/harbor-0.23.0" -q \
-        && ok "harbor installed from vendor/harbor-0.23.0" || bad "harbor install failed"
+    uv pip install --python "$HERE/.venv/bin/python" -e "$HARBOR_SRC" -q \
+        && ok "harbor $WANT installed from ${HARBOR_SRC#$HERE/}" || bad "harbor install failed"
     uv pip install --python "$HERE/.venv/bin/python" pyyaml -q
 fi
 
@@ -77,7 +175,8 @@ if [ -d "$HERE/vendor/zbridge" ]; then
     ZENV="$HERE/vendor/zbridge/.env"; umask 077; touch "$ZENV"
     zb_get() { grep "^$1=" "$ZENV" 2>/dev/null | head -1 | cut -d= -f2-; }
     zb_set() { local k=$1 v=$2; if grep -q "^$k=" "$ZENV" 2>/dev/null
-               then sed -i "s|^$k=.*|$k=$v|" "$ZENV"; else echo "$k=$v" >> "$ZENV"; fi; }
+               then sed "s|^$k=.*|$k=$v|" "$ZENV" > "$ZENV.tmp" && mv "$ZENV.tmp" "$ZENV"
+               else echo "$k=$v" >> "$ZENV"; fi; }
     rand() { head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9'; }
 
     [ -n "$(zb_get ZB_BRIDGE_SECRET)" ]    || zb_set ZB_BRIDGE_SECRET "zb-$(rand)"
@@ -97,6 +196,13 @@ if [ -d "$HERE/vendor/harness-levi-bridge" ]; then
             -r "$HERE/vendor/harness-levi-bridge/requirements.txt" -q \
             && ok "claude bridge venv built" || warn "claude bridge install failed"
     else ok "claude bridge venv present"; fi
+    # the launcher finds its python in this folder's .venv; `check` reads the Claude
+    # login (Keychain on macOS, ~/.claude/.credentials.json on Linux) without starting
+    if "$HERE/vendor/harness-levi-bridge/claude_code_bridge.sh" check >/dev/null 2>&1; then
+        ok "claude bridge sees a valid Claude login"
+    else
+        warn "claude bridge cannot read a Claude login: run 'claude' and log in, then './vendor/harness-levi-bridge/claude_code_bridge.sh check'"
+    fi
 fi
 
 echo

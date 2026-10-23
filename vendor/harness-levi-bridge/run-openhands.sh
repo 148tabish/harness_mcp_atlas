@@ -10,10 +10,10 @@
 # and ../fixed-tasks/run-harbor.sh picks ECR or local images as usual.
 #
 # Environment it sets up:
-#   LLM_BASE_URL    the bridge as the task containers reach it (BRIDGE_URL, default http://172.17.0.1:8765)
+#   LLM_BASE_URL    the bridge as the task containers reach it (BRIDGE_URL, default http://host.docker.internal:8765)
 #   LLM_API_KEY     the stub key the bridge strips
 #   CODEX_AUTH_B64  ~/.codex/auth.json, so the verifier's codex judge scores the rubric
-#   HARBOR          .venv-harbor/bin/harbor (harbor 0.23.0)
+#   HARBOR          .venv-harbor/bin/harbor (harbor 0.24.0)
 #
 # The bridge must already be up: ./claude_code_bridge.sh start
 set -euo pipefail
@@ -28,12 +28,12 @@ if ! curl -fsS --max-time 5 "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; 
     exit 1
 fi
 
-export LLM_BASE_URL="${BRIDGE_URL:-http://172.17.0.1:${PORT}}"
+export LLM_BASE_URL="${BRIDGE_URL:-http://host.docker.internal:${PORT}}"
 export LLM_API_KEY="${LLM_API_KEY:-sk-ant-oauth-bridge-stub}"
 export PYTHONPATH="$HERE/harbor_agent${PYTHONPATH:+:$PYTHONPATH}"
 export HARBOR="${HARBOR:-$HERE/.venv-harbor/bin/harbor}"
 if [ -z "${CODEX_AUTH_B64:-}" ] && [ -s "$HOME/.codex/auth.json" ]; then
-    CODEX_AUTH_B64="$(base64 -w0 "$HOME/.codex/auth.json")"
+    CODEX_AUTH_B64="$(base64 < "$HOME/.codex/auth.json" | tr -d '\n')"   # GNU and BSD base64
     export CODEX_AUTH_B64
 fi
 [ -n "${CODEX_AUTH_B64:-}" ] || echo "[run-openhands] no ~/.codex/auth.json: the rubric will be unscored" >&2

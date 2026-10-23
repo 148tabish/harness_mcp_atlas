@@ -12,11 +12,14 @@ input/<task>/
 ├── world_data/             # overlay that seeds the Light apps
 ├── tests/
 │   ├── test_outputs.py     # Channel A: deterministic checks, weights 1/3/5, guards negative
-│   ├── test_weights.json   # components.traj_tests.tests + components.rubric
-│   ├── rubric.json         # Channel B: criteria for the codex judge
+│   ├── test_weights.json   # {"tests": {name: weight}, "threshold", "null_floor"}
+│   ├── judge.toml          # Channel B: [[criterion]] tables for the codex judge; [judge] weight
 │   └── oracle.json, old_env.json
 ├── solution/               # solve.py, gt_env.json, TRUTH.md - graders only
-└── environment/Dockerfile  # the agent's image
+└── environment/
+    ├── Dockerfile          # the agent's image
+    └── light-servers/software/<App>/<file>.py   # optional: server code the task changes,
+                            # copied over the vendor copy at build (*.py, desc.json only)
 ```
 
 To start from a task that is already built:

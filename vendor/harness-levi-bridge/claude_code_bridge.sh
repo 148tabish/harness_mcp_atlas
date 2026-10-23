@@ -34,10 +34,14 @@ HARNESS_DIR="$(cd "${PROXY_DIR}/.." && pwd)"
 if [[ ! -x "${HARNESS_DIR}/.venv/bin/python" && -x "${HARNESS_DIR}/harness/.venv/bin/python" ]]; then
   HARNESS_DIR="${HARNESS_DIR}/harness"
 fi
+# Vendored layout: the harness's setup.sh builds this folder's own .venv.
+if [[ ! -x "${HARNESS_DIR}/.venv/bin/python" && -x "${PROXY_DIR}/.venv/bin/python" ]]; then
+  HARNESS_DIR="${PROXY_DIR}"
+fi
 PY="${AURORA_CC_PYTHON:-${HARNESS_DIR}/.venv/bin/python}"
 # Bind 0.0.0.0 so the agent-server inside the eval Docker container can reach
-# the bridge on the host (docker0 gateway 172.17.0.1 on Linux/EC2, or
-# host.docker.internal on macOS Docker Desktop).
+# the bridge on the host as host.docker.internal (Docker Desktop resolves it; on a Linux
+# engine the harness's compose template aliases it to the docker0 gateway).
 HOST="${AURORA_CC_BRIDGE_HOST:-0.0.0.0}"
 PORT="${AURORA_CC_BRIDGE_PORT:-8765}"
 # Runtime artifacts live inside proxy/ so this folder is self-contained.
@@ -136,7 +140,7 @@ case "$action" in
     echo "[bridge] up on http://${HOST}:${PORT} (PID $(cat "$PID_FILE"))" >&2
     echo "[bridge] generate trajectories with:  --llm-config proxy/claude-code-oauth.json" >&2
     echo "         (set that config's base_url to the host address your container can reach:" >&2
-    echo "          172.17.0.1:${PORT} on Linux/EC2, host.docker.internal:${PORT} on macOS)" >&2
+    echo "          host.docker.internal:${PORT} from the task containers on either OS)" >&2
     ;;
   stop)
     # Stop monitor first so it doesn't restart the bridge mid-shutdown.
