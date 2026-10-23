@@ -74,6 +74,10 @@ def atif(doc):
         if isinstance(msg, str) and msg.strip():
             final = msg
         for tc in st.get('tool_calls') or []:
+            if tc.get('function_name') == 'finish':
+                done = (tc.get('arguments') or {}).get('message')
+                if isinstance(done, str) and done.strip():
+                    final = done
             cid = tc.get('tool_call_id') or ''
             if cid and cid in by_id:
                 continue

@@ -3,10 +3,9 @@
 #
 # Build definition of the separate verifier (harbor merges this over its own base
 # compose, whose `main` builds from this directory). Two sources, same result:
-#   Dockerfile       python + pytest + mcp + codex CLI + the judge at /judge (default)
-#   Dockerfile.ecr   the ECR eval image plus these tests
-# run-harbor.sh picks Dockerfile.ecr when the ECR image can be pulled; set
-# JUDGE_DOCKERFILE yourself to force either one.
+#   Dockerfile       python + pytest + Rewardkit + the codex CLI (default, any arch)
+#   Dockerfile.ecr   the ECR eval image plus Rewardkit and these tests (linux/amd64)
+# Set JUDGE_DOCKERFILE=Dockerfile.ecr to use the ECR image.
 services:
   main:
     build:

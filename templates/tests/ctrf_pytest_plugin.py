@@ -111,7 +111,8 @@ def verdict_style(func: Any) -> str:
     fn = next((n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
     if fn is None:
         return "return"
-    return "assert" if classify_verdict(fn) == "assert" else "return"
+    style = classify_verdict(fn)
+    return style if style in ASSERTING_STYLES else "return"
 
 
 def classify_verdict(fn: ast.AST) -> str:
@@ -129,9 +130,15 @@ def classify_verdict(fn: ast.AST) -> str:
         elif isinstance(node, ast.Return) and node.value is not None \
                 and not (isinstance(node.value, ast.Constant) and node.value.value is None):
             returns_value = True
+    if returns_value and asserts:
+        return "mixed"          # `return False` early exits, asserts decide the rest
     if returns_value:
         return "return"
     return "assert" if asserts else "none"
+
+
+# styles whose None (falling off the end without raising) is a pass
+ASSERTING_STYLES = ("assert", "mixed")
 
 
 @lru_cache(maxsize=64)
@@ -170,7 +177,8 @@ def style_of(pyfuncitem) -> str:
         except OSError:
             node = None
         if node is not None:
-            return "assert" if classify_verdict(node) == "assert" else "return"
+            style = classify_verdict(node)
+            return style if style in ASSERTING_STYLES else "return"
     return verdict_style(func)
 
 
@@ -185,16 +193,29 @@ def _load_weights(path: Path) -> dict[str, float]:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    tests = (((doc or {}).get("components") or {}).get("traj_tests") or {}).get("tests")
+    # the flat authoring format {"tests": {...}} or the older components block
+    tests = (((doc or {}).get("components") or {}).get("traj_tests") or {}).get("tests") \
+        or (doc or {}).get("tests")
     if not isinstance(tests, dict):
         return {}
     return {k: v for k, v in tests.items() if isinstance(v, (int, float))}
 
 
+def _load_polarity(path: Path) -> str:
+    """test_weights.json guard_polarity: fail_charges (default) or pass_charges."""
+    try:
+        gp = json.loads(path.read_text(encoding="utf-8")).get("guard_polarity", "fail_charges")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        gp = "fail_charges"
+    return gp if gp in ("fail_charges", "pass_charges") else "fail_charges"
+
+
 class CtrfReporter:
-    def __init__(self, out_path: Path, weights: dict[str, float]) -> None:
+    def __init__(self, out_path: Path, weights: dict[str, float],
+                 polarity: str = "fail_charges") -> None:
         self.out_path = out_path
         self.weights = weights
+        self.polarity = polarity
         # name -> {"status": str, "duration": float seconds}
         self.results: dict[str, dict[str, Any]] = {}
         # name -> value the test body returned (None for assert-style tests)
@@ -258,7 +279,7 @@ class CtrfReporter:
                 # and nothing after it -- gave no verdict, and pytest's
                 # "passed" must not become earned weight. Unweighted helpers
                 # keep pytest's outcome; they are never scored anyway.
-                if name in self.weights and self.styles.get(name) != "assert":
+                if name in self.weights and self.styles.get(name) not in ASSERTING_STYLES:
                     entry["status"] = "failed"
                     entry["message"] = NO_VERDICT_MESSAGE
             elif not bool(verdict):
@@ -307,14 +328,16 @@ class CtrfReporter:
                 row["message"] = entry["message"]
             tests.append(row)
 
-        # overall_score is Channel A as tests/grade.py computes it: earned
-        # positive weight, less the weight of every guard that tripped (a guard
-        # "passes" when the agent fell into its trap), over the positive total,
-        # floored at 0. Guards stay out of the denominator.
+        # overall_score is the pytest channel as reward/pytest/ledger.py computes it:
+        # earned positive weight, less the weight of every guard that tripped, over the
+        # positive total, floored at 0. A guard trips when it fails ("fail_charges", the
+        # default) or, for the older template polarity, when it passes. Guards stay out
+        # of the denominator.
+        tripped_status = "failed" if self.polarity == "fail_charges" else "passed"
         earned_pos = sum(self.weights.get(t["name"], 0) for t in tests
                          if t["status"] == "passed" and (self.weights.get(t["name"], 0) or 0) > 0)
         penalty = sum(-self.weights.get(t["name"], 0) for t in tests
-                      if t["status"] == "passed" and (self.weights.get(t["name"], 0) or 0) < 0)
+                      if t["status"] == tripped_status and (self.weights.get(t["name"], 0) or 0) < 0)
         total_pos = sum(w for n, w in self.weights.items() if w > 0
                         and any(t["name"] == n and t["status"] != "skipped" for t in tests))
         ratio = max(0.0, (earned_pos - penalty) / total_pos) if total_pos > 0 else 0.0
@@ -347,5 +370,6 @@ class CtrfReporter:
 
 def pytest_configure(config) -> None:
     out = Path(os.environ.get("CTRF_OUT", DEFAULT_OUT))
-    weights = _load_weights(Path(os.environ.get("CTRF_WEIGHTS", DEFAULT_WEIGHTS)))
-    config.pluginmanager.register(CtrfReporter(out, weights), "ctrf-reporter")
+    weights_path = Path(os.environ.get("CTRF_WEIGHTS", DEFAULT_WEIGHTS))
+    config.pluginmanager.register(
+        CtrfReporter(out, _load_weights(weights_path), _load_polarity(weights_path)), "ctrf-reporter")
