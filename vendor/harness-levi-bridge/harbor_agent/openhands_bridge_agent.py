@@ -21,7 +21,9 @@ which is the built-in runner with these edits:
   6. the model's own reasoning is carried onto each step as `thought`, which
      harbor otherwise drops (nothing is ever synthesised: empty stays empty);
   7. GLM token prices are registered with LiteLLM, which knows no rate for them
-     and would report every run as costing 0.0.
+     and would report every run as costing 0.0;
+  8. the trajectory is stamped ATIF-v1.8, harbor 0.24.0's default, instead of the
+     v1.5 the runner pins.
 """
 from __future__ import annotations
 
@@ -190,6 +192,12 @@ def main():
                 events_list.append({"type": "assistant_message", "content": tool_call_args["message"],
                                     "timestamp": event.timestamp})
         elif isinstance(event, ObservationEvent):
+'''),
+    # 8. stamp the trajectory with harbor 0.24.0's own default ATIF version; the runner
+    #    pins v1.5, which predates the multimodal content parts and reads as stale
+    ('''        "schema_version": "ATIF-v1.5",
+''',
+     '''        "schema_version": "ATIF-v1.8",
 '''),
 ]
 
