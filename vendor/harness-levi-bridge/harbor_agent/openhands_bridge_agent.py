@@ -222,6 +222,15 @@ class OpenHandsSDKBridge(OpenHandsSDK):
             command = command.replace(f"chown {user}:{user} ", f"chown {user} ")
         return await super().exec_as_root(environment, command, **kw)
 
+    async def exec_as_agent(self, environment: BaseEnvironment, command: str, **kw):
+        # harbor's install() fetches the SDK with uv at its default 30 s download timeout;
+        # a slow PyPI mirror then fails the trial before the agent runs (e1ff416e, 2026-10-24,
+        # two of three attempts: "Failed to download tree-sitter ... network timeout").
+        # Give uv room and a few more retries; the setup timeout still bounds the whole step.
+        if "uv pip install" in command:
+            command = "export UV_HTTP_TIMEOUT=300 UV_CONCURRENT_DOWNLOADS=4; " + command
+        return await super().exec_as_agent(environment, command, **kw)
+
     async def install(self, environment: BaseEnvironment) -> None:
         await super().install(environment)
         local_copy = self.logs_dir / "run_agent.py"

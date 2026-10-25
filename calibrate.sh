@@ -10,8 +10,13 @@ set -euo pipefail
 H="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; export H
 TASK=$1 AGENT=$2 JOB=$3
 # the judge env exactly as a real run gets it: model and transport from .env / models.yaml,
-# the codex login base64-encoded (a missing login only leaves the rubric channel unscored)
+# the codex login base64-encoded (a missing login only leaves the rubric channel unscored).
+# A JUDGE_MODEL / JUDGE_TRANSPORT already in the environment (an orchestrator naming the judge
+# its runs use) survives the .env sourcing, so calibration is judged by the same model as the runs.
+PRESET_MODEL="${JUDGE_MODEL:-}" PRESET_TRANSPORT="${JUDGE_TRANSPORT:-}"
 [ -f "$H/.env" ] && { set -a; . "$H/.env"; set +a; }
+[ -n "$PRESET_MODEL" ] && export JUDGE_MODEL="$PRESET_MODEL"
+[ -n "$PRESET_TRANSPORT" ] && export JUDGE_TRANSPORT="$PRESET_TRANSPORT"
 eval "$("$H/.venv/bin/python" - <<'PYEOF'
 import os, shlex, sys
 sys.path.insert(0, os.environ["H"])
