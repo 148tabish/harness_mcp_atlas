@@ -47,7 +47,7 @@ class ServicenowSession:
             self.os = connect_os(os_cfg)
 
     def get_session_dict(self):
-        return {"incidents": self.incidents}
+        return {"incidents": self.incidents, "changes": self.changes}
 
     # --- helpers -----------------------------------------------------------
     def _now(self) -> str:
