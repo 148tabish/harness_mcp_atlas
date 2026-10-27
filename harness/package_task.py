@@ -17,7 +17,10 @@ derived from out/jobs alone and is rebuilt from scratch on every package.
     <uuid>/
       instruction.md, task.toml, environment/, tests/, solution/   from the built task
       trajectories/
-        <model>/              lock.json agent.model_name: "anthropic/claude-opus-5" -> "opus-5"
+        <model>/              lock.json agent.model_name: "anthropic/claude-opus-5" -> "opus-5";
+                              a model with `package_as` in config/models.yaml ships under that
+                              name, and `package_model_name` replaces its run-time model name
+                              in every file (anthropic/glm-5.3-bedrock -> glm-5.3/, bedrock/glm-5.3)
           run_1/ ... run_N/   one per trial of that model, numbered by start time
           pass@N.json         passes against the threshold, reward per run, failure modes
           pass_summary.json   per-run and average pytest / rubric / combined scores
@@ -67,10 +70,14 @@ from pathlib import Path
 
 try:
     from .weights import threshold_of
+    from .common import load_models
 except ImportError:                      # run as a plain script
     def threshold_of(doc: dict, default: float = 0.7) -> float:
         th = doc.get("threshold")
         return float(th) if isinstance(th, (int, float)) and 0 < th <= 1 else default
+
+    def load_models() -> dict:
+        return {}
 
 TASK_ITEMS = ("instruction.md", "task.toml", "environment", "tests", "solution")
 VERIFIER_FILES = ("reward.json", "reward-details.json", "grade_report.json", "judge.json",
@@ -183,14 +190,92 @@ def collect_trials(jobs: list[Path], uuid: str, checksum: str | None,
 
 
 # ------------------------------------------------------------------ per trial
-def model_of(trial: Path) -> str:
-    """Short model name from lock.json: 'anthropic/claude-opus-5' -> 'opus-5'."""
+def _short(name: str) -> str:
+    """'anthropic/claude-opus-5' -> 'opus-5'."""
+    name = name.rsplit("/", 1)[-1]
+    return name[len("claude-"):] if name.startswith("claude-") else name
+
+
+def package_map() -> dict[str, str]:
+    """How the bundle names a model, from config/models.yaml.
+
+    A model entry may carry `package_as` (the folder under trajectories/) and
+    `package_model_name` (what replaces its run-time model name in every file of the
+    bundle). The Bedrock GLM route runs as anthropic/glm-5.3-bedrock, which the agent
+    needs to reach the bridge, but ships as trajectories/glm-5.3/ with bedrock/glm-5.3
+    on every step. Keys are the exact strings that get replaced: the run-time model
+    name and its short form; values are their replacements. A model without these
+    settings is not in the map and packages under its own name.
+    """
+    out: dict[str, str] = {}
+    try:
+        models = (load_models().get("models") or {})
+    except Exception:            # noqa: BLE001 - no config here: plain names
+        return out
+    for key, cfg in models.items():
+        if not isinstance(cfg, dict):
+            continue
+        full = str(cfg.get("model") or "")
+        folder = str(cfg.get("package_as") or "")
+        bundle_name = str(cfg.get("package_model_name") or "")
+        if folder and full:
+            out[_short(full)] = folder
+            out[str(key)] = folder
+        if bundle_name and full:
+            out[full] = bundle_name
+    return out
+
+
+_PACKAGE_MAP: dict[str, str] | None = None
+
+
+def relabel(name: str) -> str:
+    """The bundle's name for a run-time model string (unchanged when not mapped)."""
+    global _PACKAGE_MAP
+    if _PACKAGE_MAP is None:
+        _PACKAGE_MAP = package_map()
+    return _PACKAGE_MAP.get(name, name)
+
+
+def provider_of(name: str) -> str:
+    return name.split("/", 1)[0] if "/" in name else ""
+
+
+def relabel_tree(node, model_name: str | None = None):
+    """Apply `relabel` to every string value in a JSON tree, exact matches only, so a
+    job name or a path that merely contains the model name is left alone. With the
+    trial's run-time `model_name`, a mapped model's provider is renamed too (harbor
+    records it as a separate "provider" field): anthropic -> bedrock for the GLM route."""
+    old_prov = provider_of(model_name) if model_name else ""
+    new_prov = provider_of(relabel(model_name)) if model_name else ""
+    swap_provider = bool(old_prov and new_prov and old_prov != new_prov)
+
+    def walk(n, key=None):
+        if isinstance(n, dict):
+            return {k: walk(v, k) for k, v in n.items()}
+        if isinstance(n, list):
+            return [walk(v) for v in n]
+        if isinstance(n, str):
+            if swap_provider and key == "provider" and n == old_prov:
+                return new_prov
+            return relabel(n)
+        return n
+    return walk(node)
+
+
+def model_name_of(trial: Path) -> str:
+    """The run-time model name from lock.json: 'anthropic/claude-opus-5'."""
     lock = _load(trial / "lock.json") or {}
     name = str((lock.get("agent") or {}).get("model_name") or "")
     if not name:
         sys.exit(f"{trial.name}: lock.json has no agent.model_name")
-    name = name.rsplit("/", 1)[-1]
-    return name[len("claude-"):] if name.startswith("claude-") else name
+    return name
+
+
+def model_of(trial: Path) -> str:
+    """Folder name under trajectories/: 'anthropic/claude-opus-5' -> 'opus-5', and a
+    mapped model's `package_as` ('anthropic/glm-5.3-bedrock' -> 'glm-5.3')."""
+    return relabel(_short(model_name_of(trial)))
 
 
 def _mask_paths(node, roots):
@@ -380,7 +465,7 @@ def build_report(trial: Path, run_index: int, job_name: str, task: Path | None =
     flag = v / "state_capture_failed.txt"
     return {
         "model": model_of(trial),
-        "model_full": str((lock.get("agent") or {}).get("model_name") or ""),
+        "model_full": relabel(str((lock.get("agent") or {}).get("model_name") or "")),
         "run_index": run_index,
         "job": job_name,
         "trial": trial.name.split("__")[-1],
@@ -503,7 +588,15 @@ def build_run(trial: Path, job_name: str, run: Path, run_index: int, roots: tupl
     (run / "agent").mkdir(parents=True)
     traj = trial / "agent" / "trajectory.json"
     if traj.is_file():
-        shutil.copy2(traj, run / "agent" / "trajectory.json")
+        if relabel(model_name_of(trial)) == model_name_of(trial):
+            shutil.copy2(traj, run / "agent" / "trajectory.json")      # unmapped: byte-identical
+        else:
+            doc = _load(traj)
+            if isinstance(doc, dict):
+                for step in doc.get("steps") or []:
+                    if isinstance(step, dict) and isinstance(step.get("model_name"), str):
+                        step["model_name"] = relabel(step["model_name"])
+            (run / "agent" / "trajectory.json").write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
     else:
         print(f"  WARNING {trial.name}: no agent/trajectory.json")
 
@@ -529,9 +622,10 @@ def build_run(trial: Path, job_name: str, run: Path, run_index: int, roots: tupl
     for src in sorted((trial / "verifier").glob("trajectory.*.jsonl")) + sorted((trial / "verifier").glob("process.*.txt")):
         (run / "verifier" / "judge_logs").mkdir(exist_ok=True)
         shutil.copy2(src, run / "verifier" / "judge_logs" / src.name)
-    config = _mask_paths(transform_config(_load(trial / "config.json") or {}), roots)
+    run_model = model_name_of(trial)
+    config = relabel_tree(_mask_paths(transform_config(_load(trial / "config.json") or {}), roots), run_model)
     (run / "config.json").write_text(json.dumps(config, indent=4) + "\n")
-    result = _mask_paths(transform_result(_load(trial / "result.json") or {}), roots)
+    result = relabel_tree(_mask_paths(transform_result(_load(trial / "result.json") or {}), roots), run_model)
     (run / "result.json").write_text(json.dumps(result, indent=4) + "\n")
     report = build_report(trial, run_index, job_name, task)
     (run / "report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
@@ -551,6 +645,9 @@ def main() -> int:
     ap.add_argument("--any-checksum", action="store_true",
                     help="also package trials that ran an older build of this task")
     ap.add_argument("--force", action="store_true", help="accepted for compatibility; the bundle is always rebuilt")
+    ap.add_argument("--allow-mixed", action="store_true",
+                    help="let runs of two different models share one trajectories/<model> folder "
+                         "(models.yaml package_as maps them to the same name)")
     args = ap.parse_args()
 
     task = args.task.resolve()
@@ -589,8 +686,15 @@ def main() -> int:
             shutil.copy2(src, dest / item)
 
     by_model: dict[str, list[tuple[Path, str]]] = {}
+    sources: dict[str, set[str]] = {}
     for trial, job_name in trials:                   # already in start order
-        by_model.setdefault(model_of(trial), []).append((trial, job_name))
+        folder = model_of(trial)
+        by_model.setdefault(folder, []).append((trial, job_name))
+        sources.setdefault(folder, set()).add(model_name_of(trial))
+    for folder, names in sources.items():
+        if len(names) > 1 and not args.allow_mixed:
+            sys.exit(f"trajectories/{folder} would mix runs of {sorted(names)}; package them "
+                     f"separately (--jobs) or pass --allow-mixed")
 
     roots = local_roots(task, jobs)
     for model, model_trials in by_model.items():
@@ -607,7 +711,7 @@ def main() -> int:
         (runs_dir / "jobs.json").write_text(json.dumps([{
             "job": j, "trials": [t.name.split("__")[-1] for t, jn, _ in runs if jn == j],
             "task_checksum": checksum,
-            "harness_summary": _load(next(x for x in jobs if x.name == j) / "harness_summary.json"),
+            "harness_summary": relabel_tree(_load(next(x for x in jobs if x.name == j) / "harness_summary.json")),
         } for j in used], indent=2) + "\n")
         print(f"  trajectories/{model}/pass@{len(runs)}.json, pass_summary.json, jobs.json")
 

@@ -21,9 +21,9 @@ which is the built-in runner with these edits:
   6. the model's own reasoning is carried onto each step as `thought`, which
      harbor otherwise drops (nothing is ever synthesised: empty stays empty);
   7. GLM token prices are registered with LiteLLM, which knows no rate for them
-     and would report every run as costing 0.0;
-  8. the trajectory is stamped ATIF-v1.8, harbor 0.24.0's default, instead of the
-     v1.5 the runner pins.
+     and would report every run as costing 0.0.
+
+  The schema_version stays the runner's own ATIF-v1.5.
 """
 from __future__ import annotations
 
@@ -107,11 +107,20 @@ _EDITS = [
     #    what the tokens would cost at list price, not what was billed.
     ('''def main():
 ''',
-     '''# (input, cached input, output) in USD per million tokens, from
-# https://docs.z.ai/guides/overview/pricing. The cached rate matters: a long
-# agent run reads the same context back every step, so at ~98% cache hits the
-# input bill is an order of magnitude below the headline rate.
+     '''# (input, cached input, output[, cache write]) in USD per million tokens. The z.ai
+# rows are from https://docs.z.ai/guides/overview/pricing; a missing cache-write
+# rate means it is billed as input. The cached rate matters: a long agent run
+# reads the same context back every step, so at ~98% cache hits the input bill
+# is an order of magnitude below the headline rate.
+#
+# glm-5.3-bedrock is the Bedrock route (vendor/bbridge, zai.glm-5.3 behind an
+# application inference profile in ap-south-1). Its row is Amazon Bedrock's
+# published on-demand rate for GLM 5.3 (https://aws.amazon.com/bedrock/pricing/,
+# Global cross-region tier: input 1.68, cache read 0.312, output 5.28, cache write
+# 2.10). The AWS price list carries no ap-south-1 row for GLM 5.3 yet; check the
+# first full run's figure against Cost Explorer and correct this row if it differs.
 _GLM_PRICES_USD_PER_MTOK = {
+    "glm-5.3-bedrock": (1.68, 0.312, 5.28, 2.10),
     "glm-5.3-flash": (0.15, 0.03, 0.50),
     "glm-5.3-flashx": (0.37, 0.075, 1.25),
     "glm-5.3": (1.4, 0.26, 4.4),
@@ -128,14 +137,15 @@ def _register_glm_pricing(model: str) -> None:
     price = _GLM_PRICES_USD_PER_MTOK.get(model.split("/")[-1])
     if not price:
         return
-    inp, cached, out = price
+    inp, cached, out = price[:3]
+    write = price[3] if len(price) > 3 else inp
     try:
         import litellm
         litellm.register_model({
             model: {
                 "input_cost_per_token": inp / 1_000_000,
                 "cache_read_input_token_cost": cached / 1_000_000,
-                "cache_creation_input_token_cost": inp / 1_000_000,
+                "cache_creation_input_token_cost": write / 1_000_000,
                 "output_cost_per_token": out / 1_000_000,
                 "litellm_provider": model.split("/")[0] if "/" in model else "anthropic",
                 "mode": "chat",
@@ -192,12 +202,6 @@ def main():
                 events_list.append({"type": "assistant_message", "content": tool_call_args["message"],
                                     "timestamp": event.timestamp})
         elif isinstance(event, ObservationEvent):
-'''),
-    # 8. stamp the trajectory with harbor 0.24.0's own default ATIF version; the runner
-    #    pins v1.5, which predates the multimodal content parts and reads as stale
-    ('''        "schema_version": "ATIF-v1.5",
-''',
-     '''        "schema_version": "ATIF-v1.8",
 '''),
 ]
 

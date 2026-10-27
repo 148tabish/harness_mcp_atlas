@@ -2,6 +2,8 @@
 #
 #   route: claude  -> vendor/harness-levi-bridge (Claude Code OAuth), port 8765
 #   route: zai     -> vendor/zbridge (z.ai GLM Coding Plan), port 8766
+#   route: bedrock -> vendor/bbridge (Amazon Bedrock Converse, GLM 5.3 via an
+#                     application inference profile + Bedrock API key), port 8767
 #
 # `base_url` is the bridge as the task containers reach it: host.docker.internal,
 # which Docker Desktop resolves itself and the compose template aliases to the docker0
@@ -37,6 +39,13 @@ models:
     route: zai
     model: anthropic/glm-4.6v
     vision: true
+  glm-5.3-bedrock:
+    route: bedrock
+    model: anthropic/glm-5.3-bedrock   # run-time name: the agent needs anthropic/ to reach the bridge,
+                                       # and the runner prices this name at Bedrock's rate (not z.ai's)
+    package_as: glm-5.3                # the bundle: trajectories/glm-5.3/, beside opus-5/
+    package_model_name: bedrock/glm-5.3   # replaces the run-time name in every file of the bundle
+    vision: false                # zai.glm-5.3 is text-only on Bedrock; images arrive as a text note
 
 routes:
   claude:
@@ -51,6 +60,12 @@ routes:
     health: http://127.0.0.1:8766/healthz
     base_url: http://host.docker.internal:8766
     api_key_from_env: ZB_BRIDGE_SECRET   # read from vendor/zbridge/.env
+  bedrock:
+    dir: vendor/bbridge
+    start: ./bbridge.sh start
+    health: http://127.0.0.1:8767/healthz
+    base_url: http://host.docker.internal:8767
+    api_key_from_env: BB_BRIDGE_SECRET   # read from vendor/bbridge/.env
 
 defaults:
   model: opus-5          # --model; the agent the trajectories are produced with

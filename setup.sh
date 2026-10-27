@@ -129,6 +129,7 @@ else
     warn "JUDGE_TRANSPORT=$JUDGE_TRANSPORT is not codex or claude-code"
 fi
 [ -s "$HERE/vendor/zbridge/.env" ] && ok "zbridge .env present" || warn "vendor/zbridge/.env missing (GLM route)"
+[ -s "$HERE/vendor/bbridge/.env" ] && ok "bbridge .env present" || warn "vendor/bbridge/.env missing (glm-5.3-bedrock route)"
 # the claude CLI keeps its login in ~/.claude/.credentials.json on Linux and in the
 # Keychain on macOS; the bridge reads either
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
@@ -188,6 +189,33 @@ if [ -d "$HERE/vendor/zbridge" ]; then
         warn "no ZB_ZAI_API_KEY in .env: the GLM routes will not authenticate"
     fi
     chmod 600 "$ZENV"
+fi
+if [ -d "$HERE/vendor/bbridge" ]; then
+    if [ ! -x "$HERE/vendor/bbridge/.venv/bin/python" ]; then
+        uv venv "$HERE/vendor/bbridge/.venv" --python 3.12 >/dev/null
+        (cd "$HERE/vendor/bbridge" && uv pip install --python .venv/bin/python -e . -q) \
+            && ok "bbridge venv built" || bad "bbridge install failed"
+    else ok "bbridge venv present"; fi
+    # vendor/bbridge/.env is derived like zbridge's: key, ARN and region come from the
+    # top-level .env, the two secrets are generated once and then left alone.
+    BENV="$HERE/vendor/bbridge/.env"; umask 077; touch "$BENV"
+    bb_get() { grep "^$1=" "$BENV" 2>/dev/null | head -1 | cut -d= -f2-; }
+    bb_set() { local k=$1 v=$2; if grep -q "^$k=" "$BENV" 2>/dev/null
+               then sed "s|^$k=.*|$k=$v|" "$BENV" > "$BENV.tmp" && mv "$BENV.tmp" "$BENV"
+               else echo "$k=$v" >> "$BENV"; fi; }
+    rand() { head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9'; }
+
+    [ -n "$(bb_get BB_BRIDGE_SECRET)" ]    || bb_set BB_BRIDGE_SECRET "bb-$(rand)"
+    [ -n "$(bb_get BB_THINKING_SIG_KEY)" ] || bb_set BB_THINKING_SIG_KEY "$(rand)"
+    [ -n "${BEDROCK_GLM_ARN:-}" ] && [ "$(bb_get BB_MODEL_ARN)" != "$BEDROCK_GLM_ARN" ] && bb_set BB_MODEL_ARN "$BEDROCK_GLM_ARN"
+    [ -n "${BEDROCK_REGION:-}" ]  && [ "$(bb_get BB_REGION)" != "$BEDROCK_REGION" ]  && bb_set BB_REGION "$BEDROCK_REGION"
+    if [ -n "${BEDROCK_API_KEY:-}" ]; then
+        [ "$(bb_get BB_BEDROCK_API_KEY)" = "$BEDROCK_API_KEY" ] || { bb_set BB_BEDROCK_API_KEY "$BEDROCK_API_KEY"
+            ok "pushed BEDROCK_API_KEY from .env into vendor/bbridge/.env"; }
+    elif [ -z "$(bb_get BB_BEDROCK_API_KEY)" ]; then
+        warn "no BEDROCK_API_KEY in .env: the glm-5.3-bedrock route will not authenticate"
+    fi
+    chmod 600 "$BENV"
 fi
 if [ -d "$HERE/vendor/harness-levi-bridge" ]; then
     if [ ! -x "$HERE/vendor/harness-levi-bridge/.venv/bin/python" ]; then

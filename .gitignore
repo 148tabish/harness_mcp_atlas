@@ -4,6 +4,7 @@ out/
 vendor/*/.venv*/
 vendor/*/logs/
 vendor/zbridge/.env
+vendor/bbridge/.env
 vendor/*/.*.pid
 __pycache__/
 *.pyc
