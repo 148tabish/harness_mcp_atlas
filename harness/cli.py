@@ -1,4 +1,4 @@
-"""harness cli: validate -> build -> run -> report -> package.
+"""harness cli: validate -> build -> run -> report -> finance -> package.
 
     python -m harness.cli --task input/wraysbury --model opus-5 -k 8 -n 2
 
@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import build as build_mod
+from . import finance as finance_mod
 from . import regrade as regrade_mod
 from . import report as report_mod
 from . import runjob
@@ -21,7 +22,7 @@ from .common import (BUILD_DIR, Failure, JOBS_DIR, PACKAGED_DIR, ROOT, die,
                      load_models, open_log, run, say)
 from .validate import validate
 
-STEPS = ("validate", "build", "run", "regrade", "report", "package")
+STEPS = ("validate", "build", "run", "regrade", "report", "finance", "package")
 # a fresh run grades as it goes; regrade is for re-verifying a job that already ran
 DEFAULT_STEPS = tuple(s for s in STEPS if s != "regrade")
 
@@ -68,7 +69,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--only", choices=STEPS, action="append",
                     help="run just these steps (repeatable)")
     ap.add_argument("--no-package", action="store_true", help="stop after the report")
-    ap.add_argument("--job", type=Path, help="existing job folder, for --only report/package")
+    ap.add_argument("--finance-strict", action="store_true",
+                    help="fail the run when a finance post fails (default: log and go on)")
+    ap.add_argument("--job", type=Path, help="existing job folder, for --only report/finance/package")
     args = ap.parse_args(argv)
 
     steps = set(args.only or DEFAULT_STEPS)
@@ -120,6 +123,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if "report" in steps:
             report_mod.summarise(job, task_dir, args.threshold)
+
+        if "finance" in steps:
+            # off unless FINANCE_REPORT=true and the model is listed in
+            # FINANCE_REPORT_MODELS (glm-5.3-bedrock); opus-5 never posts
+            finance_mod.report_job(job, task_uuid, args.model, strict=args.finance_strict)
 
         if "package" in steps:
             # every job of this build is packaged, so a second run adds run_N+1 and

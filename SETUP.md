@@ -242,6 +242,27 @@ make the packager write `trajectories/glm-5.3/` beside `trajectories/opus-5/`, w
 (the harbor job names keep `glm-5.3-bedrock`). Opus bundles are unchanged. Two different
 models mapped to one folder are refused unless `--allow-mixed` is passed to package_task.
 
+## Finance reporting
+
+The `finance` step (after `report`, before `package`) POSTs one usage record per trial to
+the Odoo Finance API, following `finance-api-integration-doc.md`. It is off by default and
+only ever posts for the model keys in `FINANCE_REPORT_MODELS` (`glm-5.3-bedrock`); opus-5
+runs never post. Switch it on in `.env` with `FINANCE_REPORT=true`, `ODOO_URL` and
+`FINANCE_PROJECT_ID`. The payload carries the task uuid, harbor's trial name, the trial's
+finish time in UTC, `bedrock/glm-5.3` as the model name, the token split (fresh input =
+prompt minus cache reads, cache reads, output, cache writes 0) and `total_cost_usd` at
+Bedrock's rate, plus one judge line per judge model from `verifier/judge.json`.
+`subscription_id` is sent as `FINANCE_SUBSCRIPTION_ID` gives it (empty by default). A failed
+post is logged and the run goes on (`--finance-strict` fails it); a trial with a successful
+`finance_receipt.json` is never posted twice; every post is appended to
+`out/finance_ledger.jsonl`. Preview the payloads without sending:
+
+```bash
+python -m harness.finance --job out/jobs/<job> --task-id <uuid> --model glm-5.3-bedrock --dry-run
+```
+
+Report a job that already ran: `./run.sh --task input/<uuid> --model glm-5.3-bedrock --only finance --job out/jobs/<job>`.
+
 `config/models.yaml` maps each model to a bridge. GLM-5.3 is text-only: images
 reach it as `[image omitted: this model cannot view images]`. GLM-5.3-flash and
 the `v` models read images. The runner patch in

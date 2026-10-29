@@ -582,6 +582,27 @@ def build_pass_files(task: Path, model_dir: Path, runs: list[tuple[Path, str, di
     (model_dir / "pass_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 
+def _copy_relabeled(src: Path, dst: Path, run_model: str) -> None:
+    """Copy a verifier file; for a mapped model, rewrite the run-time name inside it.
+
+    The judge transcript embeds the whole trajectory as escaped text, so the exact-match
+    relabel of JSON values never reaches it. The run-time name is distinctive
+    (anthropic/glm-5.3-bedrock), so a plain substring replace is safe. Unmapped
+    models are copied byte-identical.
+    """
+    new = relabel(run_model)
+    if new == run_model:
+        shutil.copy2(src, dst)
+        return
+    try:
+        text = src.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        shutil.copy2(src, dst)
+        return
+    dst.write_text(text.replace(run_model, new), encoding="utf-8")
+    shutil.copystat(src, dst)
+
+
 def build_run(trial: Path, job_name: str, run: Path, run_index: int, roots: tuple = (),
               task: Path | None = None) -> dict:
     """Write one run_i folder from a trial folder; return its report."""
@@ -611,18 +632,18 @@ def build_run(trial: Path, job_name: str, run: Path, run_index: int, roots: tupl
     kept = [e for e in entries if isinstance(e, dict) and e.get("source") == "/workspace"]
     (art / "manifest.json").write_text(json.dumps(kept, indent=2) + "\n")
 
+    run_model = model_name_of(trial)
     (run / "verifier").mkdir()
     for name in VERIFIER_FILES + VERIFIER_OPTIONAL:
         src = trial / "verifier" / name
         if src.is_file():
-            shutil.copy2(src, run / "verifier" / name)
+            _copy_relabeled(src, run / "verifier" / name, run_model)
         elif name in VERIFIER_FILES:
             print(f"  WARNING {trial.name}: no verifier/{name}")
     # the judge's own transcript and process log (Rewardkit writes them next to reward.json)
     for src in sorted((trial / "verifier").glob("trajectory.*.jsonl")) + sorted((trial / "verifier").glob("process.*.txt")):
         (run / "verifier" / "judge_logs").mkdir(exist_ok=True)
-        shutil.copy2(src, run / "verifier" / "judge_logs" / src.name)
-    run_model = model_name_of(trial)
+        _copy_relabeled(src, run / "verifier" / "judge_logs" / src.name, run_model)
     config = relabel_tree(_mask_paths(transform_config(_load(trial / "config.json") or {}), roots), run_model)
     (run / "config.json").write_text(json.dumps(config, indent=4) + "\n")
     result = relabel_tree(_mask_paths(transform_result(_load(trial / "result.json") or {}), roots), run_model)
